@@ -623,6 +623,21 @@ def test_pause_suppresses_future_runs_and_clears_calendar_persistence(
     shown = run_cli("show", "pausable", env=task_env)
     assert "State: paused" in shown.stdout
 
+    stamp.write_text("stale-again")
+    task_env["FAKE_UNIT_ENABLED"] = "enabled"
+    task_env["FAKE_UNIT_ACTIVE"] = "active"
+    _clear_commands(task_env)
+    healed = run_cli("pause", "pausable", env=task_env)
+    assert healed.returncode == 0, healed.stdout + healed.stderr
+    assert not stamp.exists()
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-pausable.timer",
+    ] in _commands(task_env)
+
 
 def test_resume_schedules_only_future_occurrences_and_restarts_intervals(
     task_env: dict[str, str],
@@ -662,6 +677,29 @@ def test_resume_schedules_only_future_occurrences_and_restarts_intervals(
         "--now",
         "pi-task-resume-int.timer",
     ] in commands
+
+    _clear_commands(task_env)
+    task_env["FAKE_UNIT_ENABLED"] = "disabled"
+    healed = run_cli("resume", "resume-cal", env=task_env)
+    assert healed.returncode == 0, healed.stdout + healed.stderr
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-resume-cal.timer",
+    ] in _commands(task_env)
+
+
+def test_interval_rejects_explicit_catch_up(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    result = _add_task(run_cli, task_env, "bad-catch-up", "--interval", "15m", "--catch-up")
+
+    assert result.returncode == 1
+    assert "do not support calendar catch-up" in result.stderr
+    assert not list(Path(task_env["XDG_CONFIG_HOME"]).glob("pi-task/tasks/*.toml"))
 
 
 def test_edit_validates_atomically_and_restarts_interval_schedules(
@@ -814,4 +852,18 @@ def test_sync_reconciles_units_and_removes_generated_orphans(
         "disable",
         "--now",
         "pi-task-orphan.timer",
+    ] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-syncable.timer",
+    ] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-syncable.timer",
     ] in commands

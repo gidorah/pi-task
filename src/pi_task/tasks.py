@@ -537,35 +537,56 @@ def scheduling_state(task: Task) -> SchedulingState:
 
 def pause_task(task_id: str) -> Task:
     task = get_task(task_id)
-    if task.paused:
-        return task
-    updated = replace(task, paused=True)
-    _write_task_definition(updated)
+    updated = task if task.paused else replace(task, paused=True)
+    if not task.paused:
+        _write_task_definition(updated)
     try:
+        # Always reconcile: a prior crash can leave paused=true while the timer is live.
         _disable_timer(task.task_id)
         _clear_timer_stamp(task.task_id)
     except TaskError:
-        with suppress(OSError, TaskError):
-            _write_task_definition(task)
+        if not task.paused:
+            with suppress(OSError, TaskError):
+                _write_task_definition(task)
         raise
     return updated
 
 
 def resume_task(task_id: str) -> Task:
     task = get_task(task_id)
-    if not task.paused:
-        return task
-    updated = replace(task, paused=False)
-    _write_task_definition(updated)
+    updated = task if not task.paused else replace(task, paused=False)
+    if task.paused:
+        _write_task_definition(updated)
     try:
-        _clear_timer_stamp(task.task_id)
+        # Always reconcile enablement. Only clear the stamp when leaving a pause so a
+        # healthy running task does not lose calendar catch-up state.
+        if task.paused:
+            _clear_timer_stamp(task.task_id)
         _enable_timer(task.task_id)
     except TaskError:
-        with suppress(OSError, TaskError):
-            _write_task_definition(task)
-            _disable_timer(task.task_id)
+        if task.paused:
+            with suppress(OSError, TaskError):
+                _write_task_definition(task)
+                _disable_timer(task.task_id)
         raise
     return updated
+
+
+def _read_timer_stamp(task_id: str) -> bytes | None:
+    path = timer_stamp_path(task_id)
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _restore_timer_stamp(task_id: str, content: bytes | None) -> None:
+    path = timer_stamp_path(task_id)
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
 
 
 def update_task(previous: Task, updated: Task) -> None:
@@ -573,14 +594,18 @@ def update_task(previous: Task, updated: Task) -> None:
         raise TaskError("task ID cannot be changed")
     paths = _task_paths(updated.task_id)
     originals = [path.read_text() if path.is_file() else None for path in paths]
+    stamp_original = _read_timer_stamp(updated.task_id)
+    stamp_mutated = False
     try:
         _install_task_files(updated)
         _systemctl("daemon-reload")
         if updated.paused:
             _disable_timer(updated.task_id)
             _clear_timer_stamp(updated.task_id)
+            stamp_mutated = True
         elif previous.paused:
             _clear_timer_stamp(updated.task_id)
+            stamp_mutated = True
             _enable_timer(updated.task_id)
         else:
             # Interval edits always restart so the next fire is one full interval away.
@@ -602,6 +627,7 @@ def update_task(previous: Task, updated: Task) -> None:
                     or previous.schedule != updated.schedule
                 ):
                     _clear_timer_stamp(updated.task_id)
+                    stamp_mutated = True
                 _enable_timer(updated.task_id)
     except BaseException:
         for path, original in zip(paths, originals, strict=True):
@@ -609,6 +635,9 @@ def update_task(previous: Task, updated: Task) -> None:
                 path.unlink(missing_ok=True)
             else:
                 path.write_text(original)
+        if stamp_mutated:
+            with suppress(OSError):
+                _restore_timer_stamp(updated.task_id, stamp_original)
         with suppress(TaskError):
             _systemctl("daemon-reload")
         if not previous.paused:
@@ -671,6 +700,11 @@ def sync_tasks() -> SyncResult:
         if task.paused:
             with suppress(TaskError):
                 _disable_timer(task.task_id)
+            _clear_timer_stamp(task.task_id)
         else:
+            # Restart so live timers pick up rewritten OnCalendar/OnActiveSec values.
+            # Keep the stamp so calendar catch-up survives reconciliation.
+            with suppress(TaskError):
+                _disable_timer(task.task_id)
             _enable_timer(task.task_id)
     return SyncResult(tasks=len(tasks), orphans_removed=orphans_removed)

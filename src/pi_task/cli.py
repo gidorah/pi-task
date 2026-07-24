@@ -126,10 +126,11 @@ def add(
         "--interval",
         help="Elapsed interval duration such as 15m or 2h.",
     ),
-    catch_up: bool = typer.Option(
-        True,
+    catch_up: bool | None = typer.Option(
+        None,
         "--catch-up/--no-catch-up",
         help="For calendar tasks, coalesce missed occurrences after downtime.",
+        show_default=False,
     ),
     model: str | None = typer.Option(None, "--model", help="Available model as provider/model."),
     thinking: str = typer.Option("medium", "--thinking", help="Pi thinking level."),
@@ -155,6 +156,12 @@ def add(
             interval,
             interactive=interactive or (calendar is None and interval is None),
         )
+        if schedule_kind == "interval":
+            if catch_up is True:
+                raise TaskError("interval schedules do not support calendar catch-up")
+            resolved_catch_up = False
+        else:
+            resolved_catch_up = True if catch_up is None else catch_up
         task = Task(
             task_id=resolved_id,
             name=name,
@@ -163,7 +170,7 @@ def add(
             prompt=prompt_value,
             schedule_kind=schedule_kind,
             schedule=schedule_value,
-            catch_up=catch_up if schedule_kind == "calendar" else False,
+            catch_up=resolved_catch_up,
             model=_required(model, "Model (provider/model)"),
             thinking=thinking,
             timeout_seconds=parse_timeout(timeout),
