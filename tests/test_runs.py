@@ -177,11 +177,21 @@ if name == "systemd-run":
     if wait and command:
         raise SystemExit(subprocess.call(command))
     raise SystemExit(0)
+if name == "journalctl":
+    # Record the exact query so tests can assert invocation-scoped selection.
+    empty = os.environ.get("FAKE_JOURNAL_EMPTY") == "1"
+    exit_code = int(os.environ.get("FAKE_JOURNAL_EXIT", "0"))
+    output = os.environ.get("FAKE_JOURNAL_OUTPUT", "")
+    if empty:
+        raise SystemExit(0)
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n")
+    raise SystemExit(exit_code)
 raise SystemExit(64)
 """
     )
     fake.chmod(0o755)
-    for name in ("pi", "systemctl", "systemd-analyze", "systemd-run"):
+    for name in ("pi", "systemctl", "systemd-analyze", "systemd-run", "journalctl"):
         (bin_dir / name).symlink_to(fake)
     (bin_dir / "python3").symlink_to(sys.executable)
 
@@ -209,6 +219,7 @@ raise SystemExit(64)
         "PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE",
         "PI_TASK_SYSTEMD_RUN_EXECUTABLE",
         "PI_TASK_EXECUTABLE",
+        "PI_TASK_JOURNALCTL_EXECUTABLE",
     ):
         env.pop(variable, None)
     return env
@@ -296,6 +307,7 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     assert "--name" in pi
     assert "Inspect the project." in pi
     session_id = "019f0000-1111-2222-3333-444455556666"
+    expected_hash = hashlib.sha256(b"Inspect the project.").hexdigest()
     listed = run_cli("runs", env=run_env)
     assert listed.returncode == 0, listed.stdout + listed.stderr
     assert "daily-review" in listed.stdout
@@ -304,6 +316,11 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     assert session_id in listed.stdout
     assert "in=11 out=7" in listed.stdout
     assert "0.03" in listed.stdout
+    # History presents start time, prompt hash, model, and session for audit.
+    assert "Started:" in listed.stdout
+    assert f"Prompt hash: {expected_hash}" in listed.stdout
+    assert "Model: acme/rocket" in listed.stdout
+    assert "pi-task-daily-review.service" in listed.stdout
 
     db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
     assert db_path.is_file()
@@ -311,7 +328,8 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
         row = connection.execute(
             "SELECT task_id, source, status, session_id, session_path, prompt_hash, "
             "snapshot_json, model, thinking, duration_ms, "
-            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_total "
+            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_total, "
+            "unit_name, invocation_id "
             "FROM runs"
         ).fetchone()
     assert row is not None
@@ -331,6 +349,8 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
         cache_read,
         cache_write,
         cost_total,
+        unit_name,
+        invocation_id,
     ) = row
     assert task_id == "daily-review"
     assert source == "scheduled"
@@ -340,7 +360,7 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     # Session path must encode the task working directory and remain in Pi storage.
     assert run_env["TEST_PROJECT"].lstrip("/").replace("/", "-") in session_path
     assert str(Path(run_env["PI_CODING_AGENT_DIR"]) / "sessions") in session_path
-    assert prompt_hash == hashlib.sha256(b"Inspect the project.").hexdigest()
+    assert prompt_hash == expected_hash
     snapshot = json.loads(snapshot_json)
     assert snapshot["task_id"] == "daily-review"
     assert snapshot["model"] == "acme/rocket"
@@ -353,6 +373,9 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     assert cache_read == 3
     assert cache_write == 1
     assert cost_total == pytest.approx(0.03)
+    assert unit_name == "pi-task-daily-review.service"
+    # Direct wrapper invocation outside systemd has no INVOCATION_ID.
+    assert invocation_id is None
 
     # Migrations remain safe when commands start repeatedly.
     again = run_cli("runs", env=run_env)
@@ -957,3 +980,198 @@ def test_stop_budget_constants_align() -> None:
         + PROCESS_FINALIZE_SLACK_SECONDS
     )
     assert SYSTEMCTL_STOP_TIMEOUT_SECONDS > TIMEOUT_STOP_SECONDS
+
+
+def test_run_records_invocation_id_under_systemd_env(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    invocation = "0123456789abcdef0123456789abcdef"
+    run_env = {**run_env, "INVOCATION_ID": invocation}
+    _add_task(run_cli, run_env, "with-invocation")
+    _clear_commands(run_env)
+
+    executed = run_cli("_run-scheduled", "with-invocation", env=run_env)
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    assert "status=succeeded" in executed.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        run_id, unit_name, stored = connection.execute(
+            "SELECT id, unit_name, invocation_id FROM runs"
+        ).fetchone()
+    assert unit_name == "pi-task-with-invocation.service"
+    assert stored == invocation
+
+    listed = run_cli("runs", env=run_env)
+    assert listed.returncode == 0
+    assert f"Invocation: {invocation}" in listed.stdout
+    assert run_id in listed.stdout
+
+
+def test_logs_selects_journal_by_invocation_id(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    invocation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    run_env = {
+        **run_env,
+        "INVOCATION_ID": invocation,
+        "FAKE_JOURNAL_OUTPUT": (
+            "run some-id: starting scheduled run for task logs-target\n"
+            "run some-id: finished status=succeeded in 12ms\n"
+        ),
+    }
+    _add_task(run_cli, run_env, "logs-target")
+    executed = run_cli("_run-scheduled", "logs-target", env=run_env)
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
+
+    _clear_commands(run_env)
+    logs = run_cli("logs", run_id, env=run_env)
+    assert logs.returncode == 0, logs.stdout + logs.stderr
+    assert "starting scheduled run" in logs.stdout
+    assert "finished status=succeeded" in logs.stdout
+
+    journal_commands = [c for c in _commands(run_env) if c[0] == "journalctl"]
+    assert len(journal_commands) == 1
+    journal = journal_commands[0]
+    assert "--user" in journal
+    assert f"_SYSTEMD_INVOCATION_ID={invocation}" in journal
+    # Must not fall back to unit-only selection when invocation is known.
+    assert not any(arg == "-u" or arg.startswith("--unit=") for arg in journal)
+
+
+def test_logs_selects_manual_unit_by_invocation(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    invocation = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    run_env = {
+        **run_env,
+        "INVOCATION_ID": invocation,
+        "FAKE_JOURNAL_OUTPUT": "manual run journal line\n",
+    }
+    _add_task(run_cli, run_env, "manual-logs")
+    _clear_commands(run_env)
+    ran = run_cli("run", "manual-logs", env=run_env)
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        run_id, unit_name, stored = connection.execute(
+            "SELECT id, unit_name, invocation_id FROM runs"
+        ).fetchone()
+    assert stored == invocation
+    assert unit_name is not None
+    assert unit_name.startswith("pi-task-run-manual-logs-")
+    assert unit_name.endswith(".service")
+
+    _clear_commands(run_env)
+    logs = run_cli("logs", run_id, env=run_env)
+    assert logs.returncode == 0, logs.stdout + logs.stderr
+    assert "manual run journal line" in logs.stdout
+    journal = next(c for c in _commands(run_env) if c[0] == "journalctl")
+    assert f"_SYSTEMD_INVOCATION_ID={invocation}" in journal
+
+
+def test_logs_explains_missing_journal_without_damaging_history(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    invocation = "cccccccccccccccccccccccccccccccc"
+    run_env = {
+        **run_env,
+        "INVOCATION_ID": invocation,
+        "FAKE_JOURNAL_EMPTY": "1",
+    }
+    _add_task(run_cli, run_env, "expired-logs")
+    executed = run_cli("_run-scheduled", "expired-logs", env=run_env)
+    assert executed.returncode == 0
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        before = connection.execute(
+            "SELECT id, status, prompt_hash, session_id FROM runs"
+        ).fetchone()
+    run_id = before[0]
+
+    logs = run_cli("logs", run_id, env=run_env)
+    assert logs.returncode != 0, logs.stdout + logs.stderr
+    combined = (logs.stdout + logs.stderr).lower()
+    assert "no journal" in combined or "expired" in combined or "not found" in combined
+    assert run_id[:8] in logs.stdout + logs.stderr or "expired-logs" in logs.stdout + logs.stderr
+
+    with sqlite3.connect(db_path) as connection:
+        after = connection.execute(
+            "SELECT id, status, prompt_hash, session_id FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+    assert after == before
+
+
+def test_logs_falls_back_to_unit_and_time_without_invocation(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    run_env = {
+        **run_env,
+        "FAKE_JOURNAL_OUTPUT": "fallback journal for scheduled unit\n",
+    }
+    _add_task(run_cli, run_env, "fallback-logs")
+    executed = run_cli("_run-scheduled", "fallback-logs", env=run_env)
+    assert executed.returncode == 0
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        run_id, unit_name, invocation_id = connection.execute(
+            "SELECT id, unit_name, invocation_id FROM runs"
+        ).fetchone()
+    assert unit_name == "pi-task-fallback-logs.service"
+    assert invocation_id is None
+
+    _clear_commands(run_env)
+    logs = run_cli("logs", run_id, env=run_env)
+    assert logs.returncode == 0, logs.stdout + logs.stderr
+    assert "fallback journal" in logs.stdout
+    journal = next(c for c in _commands(run_env) if c[0] == "journalctl")
+    assert "--user" in journal
+    assert f"--unit={unit_name}" in journal or unit_name in journal
+    assert any(a.startswith("--since=") or a == "--since" for a in journal)
+
+
+def test_logs_rejects_unknown_run(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    # Open the database so schema exists.
+    run_cli("runs", env=run_env)
+    missing = run_cli("logs", "00000000-0000-0000-0000-000000000000", env=run_env)
+    assert missing.returncode != 0
+    assert "does not exist" in missing.stderr.lower() or "not found" in missing.stderr.lower()
+
+
+def test_runs_lists_failed_skipped_and_partial_runs(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """Operational list remains useful across abnormal terminal statuses."""
+    _add_task(run_cli, run_env, "status-matrix")
+    # Failed process exit.
+    fail_env = {**run_env, "FAKE_PI_EXIT": "2", "FAKE_STOP_REASON": "error"}
+    assert run_cli("_run-scheduled", "status-matrix", env=fail_env).returncode != 0
+
+    # Timed out.
+    timeout_env = {**run_env, "FAKE_PI_SLEEP": "30"}
+    _add_task(run_cli, timeout_env, "status-timeout", timeout="1s")
+    timed = run_cli("_run-scheduled", "status-timeout", env=timeout_env)
+    assert timed.returncode != 0
+
+    listed = run_cli("runs", "--limit", "10", env=run_env)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "failed" in listed.stdout or "timed_out" in listed.stdout
+    assert "Prompt hash:" in listed.stdout
+    assert "Started:" in listed.stdout

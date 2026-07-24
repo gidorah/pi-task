@@ -270,6 +270,12 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def current_invocation_id() -> str | None:
+    """Return systemd's per-activation invocation id when the wrapper runs under a unit."""
+    value = os.environ.get("INVOCATION_ID", "").strip()
+    return value or None
+
+
 @dataclass(frozen=True)
 class PreparedRun:
     """Immutable startup context for one wrapper invocation."""
@@ -283,6 +289,8 @@ class PreparedRun:
     run_id: str
     session_name: str
     started: datetime
+    unit_name: str
+    invocation_id: str | None
 
     @classmethod
     def build(
@@ -306,6 +314,8 @@ class PreparedRun:
             run_id=resolved_id,
             session_name=f"pi-task:{task.task_id}:{resolved_id[:8]}",
             started=_now(),
+            unit_name=unit_name_for_run(task_id=task.task_id, run_id=resolved_id, source=source),
+            invocation_id=current_invocation_id(),
         )
 
     def as_new_run(self) -> NewRun:
@@ -319,6 +329,8 @@ class PreparedRun:
             snapshot_json=self.snapshot_json,
             model=self.snapshot.model,
             thinking=self.snapshot.thinking,
+            unit_name=self.unit_name,
+            invocation_id=self.invocation_id,
         )
 
 
@@ -513,7 +525,12 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
     snapshot = prepared.snapshot
     run_id = prepared.run_id
     started = prepared.started
-    _log(f"run {run_id}: starting {prepared.source} run for task {task.task_id}")
+    _log(
+        f"run {run_id}: starting {prepared.source} run for task {task.task_id} "
+        f"(unit={prepared.unit_name}"
+        + (f", invocation={prepared.invocation_id}" if prepared.invocation_id else "")
+        + f", prompt_hash={prepared.prompt_hash[:12]})"
+    )
     pi_executable = resolve_pi()
     command = build_pi_command(
         pi_executable=pi_executable,
@@ -736,6 +753,7 @@ def _record_lock_conflict(prepared: PreparedRun, conflict: LockConflict) -> int:
                 error=error,
             ),
         )
+    _log(f"run {prepared.run_id}: finished status={status} in {duration_ms}ms")
     return exit_code
 
 
@@ -794,5 +812,5 @@ def _finalize(
     if usage.cost_total is not None:
         usage_parts.append(f"cost={usage.cost_total}")
     usage_suffix = f" ({', '.join(usage_parts)})" if usage_parts else ""
-    _log(f"run {run_id}: finished in {duration_ms}ms{usage_suffix}")
+    _log(f"run {run_id}: finished status={status} in {duration_ms}ms{usage_suffix}")
     return 0 if status == "succeeded" else 1

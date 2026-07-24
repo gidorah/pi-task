@@ -13,7 +13,7 @@ from typing import Literal, cast
 RunSource = Literal["scheduled", "manual"]
 RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled", "skipped"]
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -42,6 +42,10 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX IF NOT EXISTS idx_runs_task_started ON runs (task_id, started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_runs_started ON runs (started_at DESC);
     """,
+    2: """
+    ALTER TABLE runs ADD COLUMN unit_name TEXT;
+    ALTER TABLE runs ADD COLUMN invocation_id TEXT;
+    """,
 }
 
 
@@ -67,6 +71,8 @@ class RunRecord:
     cache_write_tokens: int | None
     cost_total: float | None
     error: str | None
+    unit_name: str | None = None
+    invocation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +86,8 @@ class NewRun:
     snapshot_json: str
     model: str
     thinking: str
+    unit_name: str | None = None
+    invocation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,12 +160,12 @@ def insert_run(connection: sqlite3.Connection, run: NewRun) -> None:
             id, task_id, source, status, started_at, finished_at, duration_ms,
             session_id, session_path, session_name, prompt_hash, snapshot_json,
             model, thinking, input_tokens, output_tokens, cache_read_tokens,
-            cache_write_tokens, cost_total, error
+            cache_write_tokens, cost_total, error, unit_name, invocation_id
         ) VALUES (
             ?, ?, ?, 'running', ?, NULL, NULL,
             NULL, NULL, ?, ?, ?,
             ?, ?, NULL, NULL, NULL,
-            NULL, NULL, NULL
+            NULL, NULL, NULL, ?, ?
         )
         """,
         (
@@ -170,6 +178,8 @@ def insert_run(connection: sqlite3.Connection, run: NewRun) -> None:
             run.snapshot_json,
             run.model,
             run.thinking,
+            run.unit_name,
+            run.invocation_id,
         ),
     )
 
@@ -223,7 +233,12 @@ def finish_run(
     return cursor.rowcount > 0
 
 
+def _row_keys(row: sqlite3.Row) -> set[str]:
+    return set(row.keys())
+
+
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
+    keys = _row_keys(row)
     return RunRecord(
         id=row["id"],
         task_id=row["task_id"],
@@ -245,6 +260,8 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
         cache_write_tokens=row["cache_write_tokens"],
         cost_total=row["cost_total"],
         error=row["error"],
+        unit_name=row["unit_name"] if "unit_name" in keys else None,
+        invocation_id=row["invocation_id"] if "invocation_id" in keys else None,
     )
 
 
