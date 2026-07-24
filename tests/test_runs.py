@@ -385,6 +385,7 @@ def test_service_unit_invokes_wrapper_with_task_identity(
     assert "_run-scheduled wired --source scheduled" in service
     # 20m timeout (1200s) + 120s hung-wrapper grace
     assert "RuntimeMaxSec=1320" in service
+    assert "TimeoutStopSec=30" in service
 
 
 def test_scheduled_entrypoint_rejects_unknown_source(
@@ -422,6 +423,7 @@ def test_run_waits_records_manual_source_and_reports_status(
     # Full UUID hex suffix (32 chars) keeps unit names unique without hyphens.
     assert len(unit_args[0].removeprefix("--unit=pi-task-run-manual-wait-")) == 32
     assert "--property=RuntimeMaxSec=1320" in invocation
+    assert "--property=TimeoutStopSec=30" in invocation
     assert "_run-scheduled" in invocation
     assert "manual-wait" in invocation
     source_index = invocation.index("--source")

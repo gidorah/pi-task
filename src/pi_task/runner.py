@@ -19,6 +19,7 @@ from typing import Any
 from pi_task.db import (
     NewRun,
     RunCompletion,
+    RunRecord,
     RunSource,
     RunStatus,
     abandon_orphaned_runs,
@@ -29,7 +30,7 @@ from pi_task.db import (
 )
 from pi_task.events import StreamObservation, classify_run_status, consume_event_line
 from pi_task.locks import LockConflict, RunLocks, acquire_run_locks, normalize_working_directory
-from pi_task.tasks import Task, TaskError, get_task
+from pi_task.tasks import Task, TaskError, get_task, stop_user_unit, unit_name_for_run
 
 
 @dataclass(frozen=True)
@@ -161,24 +162,54 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+# Short poll interval so SIGTERM cancel is observed without a long communicate().
+_CANCEL_POLL_SECONDS = 0.25
+# Bound every post-stop pipe drain so a reparented child cannot hang the wrapper.
+_DRAIN_SECONDS = 5.0
+
+
 def _stop_process_group(process: subprocess.Popen[str], *, grace_seconds: float = 5.0) -> None:
     """Terminate Pi and its process group, escalating to kill after a short grace period."""
     if process.poll() is not None:
         return
-    try:
+    with suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
     try:
         process.wait(timeout=grace_seconds)
         return
     except subprocess.TimeoutExpired:
         pass
-    try:
+    with suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    process.wait()
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=grace_seconds)
+
+
+def _drain_process(
+    process: subprocess.Popen[str], *, timeout: float = _DRAIN_SECONDS
+) -> tuple[str, str]:
+    """Read remaining stdout/stderr without hanging forever after a forced stop."""
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return stdout or "", stderr or ""
+    except subprocess.TimeoutExpired:
+        with suppress(OSError):
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1.0)
+        return "", ""
+
+
+def _terminal_status_for_flags(*, cancelled: bool, timed_out: bool) -> RunStatus:
+    """Priority for abnormal exits: sticky timeout beats a late cancel flag."""
+    if timed_out:
+        return "timed_out"
+    if cancelled:
+        return "cancelled"
+    return "failed"
 
 
 def _now() -> datetime:
@@ -305,6 +336,48 @@ def heal_orphaned_run(run_id: str) -> bool:
             locks.release()
 
 
+def _require_running_run(run_id: str) -> RunRecord:
+    with open_db() as connection:
+        record = get_run(connection, run_id)
+    if record is None:
+        raise TaskError(f"run {run_id!r} does not exist")
+    if record.status != "running":
+        raise TaskError(f"run {run_id!r} is not active (status: {record.status})")
+    return record
+
+
+def cancel_run(run_id: str) -> tuple[RunRecord, str]:
+    """Stop a recorded active run through its systemd user unit.
+
+    Returns the latest run record and the unit that was stopped. Pausing a task
+    does not cancel work; only this path targets an active unit. SIGTERM from
+    stop is recorded as cancelled (distinct from wrapper timeout).
+    """
+    _require_running_run(run_id)
+
+    # Free locks with a still-running row means a crashed wrapper, not live work.
+    if heal_orphaned_run(run_id):
+        with open_db() as connection:
+            healed = get_run(connection, run_id)
+        if healed is None:
+            raise TaskError(f"run {run_id!r} does not exist")
+        raise TaskError(
+            f"run {run_id!r} was no longer active (status: {healed.status}); "
+            "abandoned after stale lock recovery"
+        )
+
+    record = _require_running_run(run_id)
+    unit = unit_name_for_run(task_id=record.task_id, run_id=record.id, source=record.source)
+    # systemctl stop is synchronous for oneshot services; TimeoutStopSec bounds
+    # the unit, and the client timeout sits above that.
+    stop_user_unit(unit)
+    with open_db() as connection:
+        finished = get_run(connection, run_id)
+    if finished is None:
+        raise TaskError(f"run {run_id!r} disappeared after stop")
+    return finished, unit
+
+
 def _execute_locked_run(prepared: PreparedRun) -> int:
     _reap_orphaned_runs(prepared)
     with open_db() as connection:
@@ -377,18 +450,20 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
             while True:
                 if cancelled:
                     _stop_process_group(process)
-                    stdout, stderr = process.communicate()
+                    stdout, stderr = _drain_process(process)
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     _stop_process_group(process)
-                    stdout, stderr = process.communicate()
+                    stdout, stderr = _drain_process(process)
                     error = f"timed out after {task.timeout_seconds} seconds"
                     _log(f"run {run_id}: {error}")
                     break
                 try:
-                    stdout, stderr = process.communicate(timeout=min(0.25, max(remaining, 0.01)))
+                    stdout, stderr = process.communicate(
+                        timeout=min(_CANCEL_POLL_SECONDS, max(remaining, 0.01))
+                    )
                     break
                 except subprocess.TimeoutExpired:
                     continue
@@ -401,27 +476,30 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
                     if line.strip():
                         _log(f"run {run_id}: pi: {line.strip()}")
         except Exception as exc:
-            error = f"wrapper failed: {exc}"
+            error = error or f"wrapper failed: {exc}"
             _log(f"run {run_id}: {error}")
             if process.poll() is None:
                 _stop_process_group(process)
-                process.communicate()
+                _drain_process(process)
             return _finalize(
                 run_id=run_id,
                 started=started,
-                status="failed",
+                status=_terminal_status_for_flags(cancelled=cancelled, timed_out=timed_out),
                 observation=observation,
                 error=error,
             )
 
+        # Timeout already decided for this run stays sticky if SIGTERM arrives in teardown.
         status = classify_run_status(
             process_exit_code=exit_code,
             timed_out=timed_out,
-            cancelled=cancelled,
+            cancelled=cancelled and not timed_out,
             observation=observation,
         )
         if status == "cancelled":
             error = error or "run cancelled"
+        elif status == "timed_out":
+            error = error or f"timed out after {task.timeout_seconds} seconds"
         elif status != "succeeded" and error is None:
             if observation.final_stop_reason and observation.final_stop_reason != "stop":
                 error = f"final stop reason: {observation.final_stop_reason}"
@@ -443,8 +521,8 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
         )
     except BaseException as exc:
         # Ensure the run never remains stuck in "running" after wrapper death.
+        status = _terminal_status_for_flags(cancelled=cancelled, timed_out=timed_out)
         if isinstance(exc, Exception):
-            status: RunStatus = "cancelled" if cancelled else "failed"
             error = error or f"wrapper interrupted: {exc}"
             _log(f"run {run_id}: {error}")
             return _finalize(
@@ -454,7 +532,6 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
                 observation=observation,
                 error=error,
             )
-        status = "cancelled" if cancelled else "failed"
         error = error or f"wrapper interrupted by {exc.__class__.__name__}"
         _log(f"run {run_id}: {error}")
         _finalize(

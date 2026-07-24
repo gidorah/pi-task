@@ -12,12 +12,11 @@ from rich.table import Table
 
 from pi_task.db import RunRecord, get_run, list_runs, open_db
 from pi_task.doctor import run_doctor
-from pi_task.runner import execute_task_run, heal_orphaned_run, resolve_pi
+from pi_task.runner import cancel_run, execute_task_run, heal_orphaned_run, resolve_pi
 from pi_task.tasks import (
     Task,
     TaskError,
     all_tasks,
-    cancel_run,
     create_task,
     get_task,
     has_saved_project_trust,

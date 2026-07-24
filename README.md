@@ -77,7 +77,7 @@ pi-task resume-session RUN_ID
 
 `cancel` stops a recorded active scheduled or manual run by stopping its systemd user unit. The wrapper forwards termination to Pi with a short grace period, records status `cancelled` (distinct from `timed_out` and `failed`), and keeps any partial Pi session for later inspection or `resume-session`. Pausing a task only suppresses future schedule activations and does not cancel work already running.
 
-The wrapper enforces each task's timeout (default 30 minutes) and records `timed_out` runs. Generated services and manual transient units also set `RuntimeMaxSec` slightly above the task timeout so systemd can kill a hung wrapper as a backstop. Failed, cancelled, and timed-out runs retain discovered session paths when Pi wrote a session before exiting. pi-task does not automatically replay failed prompts.
+The wrapper enforces each task's timeout (default 30 minutes) and records `timed_out` runs. Generated services and manual transient units also set `RuntimeMaxSec` slightly above the task timeout so systemd can kill a hung wrapper as a backstop, and `TimeoutStopSec` so unit stop during cancel stays bounded. After upgrading, run `pi-task sync` so existing scheduled units pick up these service properties. Failed, cancelled, and timed-out runs retain discovered session paths when Pi wrote a session before exiting. pi-task does not automatically replay failed prompts.
 
 `runs` lists recorded status, duration, model, and session identifiers. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage. Sessions from failed, cancelled, and timed-out runs remain available once the run is no longer active.
 
