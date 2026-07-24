@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -383,6 +384,102 @@ def _systemctl(*arguments: str, allowed_statuses: tuple[int, ...] = (0,)) -> str
         detail = result.stderr.strip() or f"systemctl exited with status {result.returncode}"
         raise TaskError(detail)
     return result.stdout.strip()
+
+
+@dataclass(frozen=True)
+class ManualRunSubmission:
+    """Result of submitting a manual run through a transient systemd service."""
+
+    run_id: str
+    unit: str
+    detach: bool
+    service_exit_code: int | None
+    service_detail: str | None = None
+
+
+def manual_unit_name(task_id: str, run_id: str) -> str:
+    """Build a unique transient unit name for one manual run."""
+    # systemd unit names accept the UUID hex form without hyphens.
+    suffix = run_id.replace("-", "")
+    return f"pi-task-run-{task_id}-{suffix}"
+
+
+def _systemd_run_detail(result: subprocess.CompletedProcess[str]) -> str | None:
+    detail = result.stderr.strip() or result.stdout.strip()
+    if detail:
+        return detail
+    if result.returncode != 0:
+        return f"systemd-run exited with status {result.returncode}"
+    return None
+
+
+def start_manual_run(task_id: str, *, detach: bool = False) -> ManualRunSubmission:
+    """Start a uniquely named transient user service that runs the task once.
+
+    The recurring timer is never started, stopped, enabled, disabled, or restarted.
+    The wrapper enforces the task timeout; this call does not add a second timeout
+    around systemd-run --wait so a finished run can still be reported from history.
+    """
+    task = get_task(task_id)
+    run_id = str(uuid.uuid4())
+    unit = manual_unit_name(task.task_id, run_id)
+    pi_task = _resolve_executable("pi-task", "PI_TASK_EXECUTABLE")
+    systemd_run = _resolve_executable("systemd-run", "PI_TASK_SYSTEMD_RUN_EXECUTABLE")
+
+    command = [
+        systemd_run,
+        "--user",
+        f"--unit={unit}",
+        "--collect",
+        "--property=Type=oneshot",
+        f"--description=Manual pi-task run {task.task_id}",
+        f"--working-directory={task.working_directory}",
+    ]
+    if not detach:
+        command.append("--wait")
+    command.extend(
+        [
+            pi_task,
+            "_run-scheduled",
+            task.task_id,
+            "--source",
+            "manual",
+            "--run-id",
+            run_id,
+        ]
+    )
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except OSError as error:
+        raise TaskError(f"could not start manual run: {error}") from error
+
+    detail = _systemd_run_detail(result)
+    if detach:
+        if result.returncode != 0:
+            raise TaskError(f"could not submit manual run: {detail}")
+        return ManualRunSubmission(
+            run_id=run_id,
+            unit=unit,
+            detach=True,
+            service_exit_code=None,
+        )
+
+    # With --wait, a non-zero exit may mean submission failure or a failed run.
+    # The caller inspects the run record when the wrapper managed to start.
+    return ManualRunSubmission(
+        run_id=run_id,
+        unit=unit,
+        detach=False,
+        service_exit_code=result.returncode,
+        service_detail=detail if result.returncode != 0 else None,
+    )
 
 
 def _task_paths(task_id: str) -> tuple[Path, Path, Path]:
