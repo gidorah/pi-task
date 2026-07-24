@@ -271,7 +271,11 @@ def _reap_orphaned_runs(prepared: PreparedRun) -> None:
 
 
 def heal_orphaned_run(run_id: str) -> bool:
-    """If a run is marked running but its locks are free, abandon it and return True."""
+    """If a run is marked running but its locks are free, abandon it and return True.
+
+    Locks are held for the whole abandon so a concurrent live wrapper cannot be
+    misclassified between probe and history update.
+    """
     with open_db() as connection:
         record = get_run(connection, run_id)
         if record is None or record.status != "running":
@@ -284,15 +288,20 @@ def heal_orphaned_run(run_id: str) -> bool:
         if not isinstance(working_directory, str):
             return False
         directory = Path(working_directory)
-        probe = RunLocks(task_id=record.task_id, working_directory=directory)
-        if not probe.try_probe():
+        locks = RunLocks(task_id=record.task_id, working_directory=directory)
+        try:
+            locks.acquire()
+        except LockConflict:
             return False
-        abandoned = abandon_orphaned_runs(
-            connection,
-            task_id=record.task_id,
-            working_directory=normalize_working_directory(directory),
-        )
-        return run_id in abandoned
+        try:
+            abandoned = abandon_orphaned_runs(
+                connection,
+                task_id=record.task_id,
+                working_directory=normalize_working_directory(directory),
+            )
+            return run_id in abandoned
+        finally:
+            locks.release()
 
 
 def _execute_locked_run(prepared: PreparedRun) -> int:

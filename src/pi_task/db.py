@@ -174,9 +174,19 @@ def insert_run(connection: sqlite3.Connection, run: NewRun) -> None:
     )
 
 
-def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompletion) -> None:
-    connection.execute(
-        """
+def finish_run(
+    connection: sqlite3.Connection,
+    run_id: str,
+    completion: RunCompletion,
+    *,
+    only_if_running: bool = False,
+) -> bool:
+    """Apply a terminal status. Returns True if a row was updated.
+
+    When ``only_if_running`` is True, skip rows already finalized (avoids
+    overwriting a live wrapper's later completion in rare races).
+    """
+    query = """
         UPDATE runs SET
             status = ?,
             finished_at = ?,
@@ -190,7 +200,11 @@ def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompl
             cost_total = ?,
             error = ?
         WHERE id = ?
-        """,
+        """
+    if only_if_running:
+        query += " AND status = 'running'"
+    cursor = connection.execute(
+        query,
         (
             completion.status,
             completion.finished_at,
@@ -206,6 +220,7 @@ def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompl
             run_id,
         ),
     )
+    return cursor.rowcount > 0
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
@@ -315,7 +330,7 @@ def abandon_orphaned_runs(
             duration_ms = max(0, int((end_moment - start_moment).total_seconds() * 1000))
         except ValueError:
             duration_ms = 0
-        finish_run(
+        updated = finish_run(
             connection,
             record.id,
             RunCompletion(
@@ -331,6 +346,8 @@ def abandon_orphaned_runs(
                 cost_total=record.cost_total,
                 error="wrapper interrupted; run abandoned after stale lock recovery",
             ),
+            only_if_running=True,
         )
-        abandoned.append(record.id)
+        if updated:
+            abandoned.append(record.id)
     return abandoned

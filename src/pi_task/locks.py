@@ -104,16 +104,6 @@ class RunLocks:
             with suppress(OSError):
                 handle.close()
 
-    def try_probe(self) -> bool:
-        """Return True if both locks can be taken briefly (no live holder)."""
-        try:
-            self.acquire()
-        except LockConflict:
-            return False
-        self.release()
-        return True
-
-
 @contextmanager
 def acquire_run_locks(task_id: str, working_directory: Path) -> Iterator[RunLocks]:
     """Acquire task then working-directory locks, or raise LockConflict.

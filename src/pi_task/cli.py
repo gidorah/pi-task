@@ -523,11 +523,12 @@ def resume_session(
             raise TaskError(f"run {run_id!r} does not exist")
         if record.status == "running":
             # Interrupted wrappers leave running rows; free locks mean no live writer.
-            if heal_orphaned_run(run_id):
-                with open_db() as connection:
-                    record = get_run(connection, run_id)
-                if record is None:
-                    raise TaskError(f"run {run_id!r} does not exist")
+            # Always re-read: another process may have reaped the row already.
+            heal_orphaned_run(run_id)
+            with open_db() as connection:
+                record = get_run(connection, run_id)
+            if record is None:
+                raise TaskError(f"run {run_id!r} does not exist")
             if record.status == "running":
                 raise TaskError(f"run {run_id!r} is still active")
         if not record.session_path:
