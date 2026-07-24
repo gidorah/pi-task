@@ -107,7 +107,8 @@ def timer_stamp_path(task_id: str) -> Path:
     return _data_home() / "systemd" / "timers" / f"stamp-pi-task-{task_id}.timer"
 
 
-def _resolve_executable(name: str, override: str) -> str:
+def resolve_executable(name: str, override: str) -> str:
+    """Resolve a hard dependency: env override first, then PATH."""
     configured = os.environ.get(override)
     if configured:
         candidate = Path(configured).expanduser()
@@ -118,6 +119,10 @@ def _resolve_executable(name: str, override: str) -> str:
     if executable is None:
         raise TaskError(f"{name} was not found on PATH")
     return executable
+
+
+# Back-compat alias for internal call sites written against the private name.
+_resolve_executable = resolve_executable
 
 
 def _run(
@@ -444,6 +449,19 @@ def unit_name_for_run(*, task_id: str, run_id: str, source: Literal["scheduled",
     if source == "scheduled":
         return scheduled_unit_name(task_id)
     return f"{manual_unit_name(task_id, run_id)}.service"
+
+
+def supervising_unit(
+    *,
+    recorded_unit: str | None,
+    task_id: str,
+    run_id: str,
+    source: Literal["scheduled", "manual"],
+) -> str:
+    """Prefer the unit stored on the run row; recompute for pre-v2 history."""
+    if recorded_unit:
+        return recorded_unit
+    return unit_name_for_run(task_id=task_id, run_id=run_id, source=source)
 
 
 def _systemd_run_detail(result: subprocess.CompletedProcess[str]) -> str | None:

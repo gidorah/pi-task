@@ -12,6 +12,7 @@ from rich.table import Table
 
 from pi_task.db import RunRecord, get_run, list_runs, open_db
 from pi_task.doctor import run_doctor
+from pi_task.journal import missing_journal_message, read_run_journal
 from pi_task.runner import cancel_run, execute_task_run, heal_orphaned_run, resolve_pi
 from pi_task.tasks import (
     Task,
@@ -73,31 +74,56 @@ def _task_error(error: TaskError) -> NoReturn:
 
 
 def _echo_run_summary(record: RunRecord, *, verbose: bool = False) -> None:
-    """Print a compact run summary shared by `run` and `runs`."""
+    """Print a run summary shared by `run` and `runs`.
+
+    Distinguishes source and terminal status, and surfaces snapshot identity,
+    timing, prompt hash, usage, and session fields when present.
+    """
     duration = f"{record.duration_ms / 1000:.1f}s" if record.duration_ms is not None else "unknown"
-    typer.echo(f"Run: {record.id}")
-    typer.echo(f"Task: {record.task_id}")
-    typer.echo(f"Source: {record.source}")
-    typer.echo(f"Status: {record.status}")
-    typer.echo(f"Duration: {duration}")
-    if verbose:
-        if record.input_tokens is None and record.output_tokens is None:
-            tokens = "unavailable"
-        else:
-            tokens = f"in={record.input_tokens or 0} out={record.output_tokens or 0}"
-        cost = "unavailable" if record.cost_total is None else str(record.cost_total)
-        typer.echo(f"Model: {record.model}")
-        typer.echo(f"Tokens: {tokens}")
-        typer.echo(f"Cost: {cost}")
-        typer.echo(f"Session: {record.session_id or ''}")
-        typer.echo(f"Session path: {record.session_path or ''}")
+    if record.input_tokens is None and record.output_tokens is None:
+        tokens = "unavailable"
     else:
-        if record.session_id:
-            typer.echo(f"Session: {record.session_id}")
-        if record.session_path:
-            typer.echo(f"Session path: {record.session_path}")
-        if record.error:
-            typer.echo(f"Error: {record.error}")
+        tokens = f"in={record.input_tokens or 0} out={record.output_tokens or 0}"
+    cost = "unavailable" if record.cost_total is None else str(record.cost_total)
+
+    # (label, value, always_print) — empty optional fields are omitted unless always.
+    fields: list[tuple[str, str | None, bool]] = [
+        ("Run", record.id, True),
+        ("Task", record.task_id, True),
+        ("Source", record.source, True),
+        ("Status", record.status, True),
+        ("Started", record.started_at, True),
+        ("Duration", duration, True),
+    ]
+    if verbose:
+        fields.extend(
+            [
+                ("Model", record.model, True),
+                ("Thinking", record.thinking, True),
+                ("Prompt hash", record.prompt_hash, True),
+                ("Tokens", tokens, True),
+                ("Cost", cost, True),
+                ("Session", record.session_id, True),
+                ("Session path", record.session_path, True),
+                ("Unit", record.unit_name, False),
+                ("Invocation", record.invocation_id, False),
+                ("Error", record.error, False),
+            ]
+        )
+    else:
+        fields.extend(
+            [
+                ("Session", record.session_id, False),
+                ("Session path", record.session_path, False),
+                ("Error", record.error, False),
+            ]
+        )
+    for label, value, always in fields:
+        if value is None or value == "":
+            if always:
+                typer.echo(f"{label}:")
+            continue
+        typer.echo(f"{label}: {value}")
 
 
 def _resolve_prompt(
@@ -531,6 +557,31 @@ def runs(
         if index:
             typer.echo("")
         _echo_run_summary(record, verbose=True)
+
+
+@app.command()
+def logs(
+    run_id: str = typer.Argument(..., help="Run ID whose journal lines should be shown."),
+) -> None:
+    """Show journald output for one run's systemd invocation.
+
+    Prefers the recorded ``INVOCATION_ID`` so repeated scheduled activations of the
+    same unit and collected transient manual units stay distinct. Missing or
+    expired journal entries are explained without changing retained run history.
+    """
+    try:
+        with open_db() as connection:
+            record = get_run(connection, run_id)
+        if record is None:
+            raise TaskError(f"run {run_id!r} does not exist")
+        text = read_run_journal(record)
+    except TaskError as error:
+        _task_error(error)
+        raise
+    if not text.strip():
+        typer.echo(missing_journal_message(record), err=True)
+        raise typer.Exit(code=1)
+    typer.echo(text.rstrip("\n"))
 
 
 @app.command("resume-session")

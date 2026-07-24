@@ -70,6 +70,7 @@ pi-task run daily-review --detach
 pi-task cancel RUN_ID
 pi-task runs
 pi-task runs daily-review
+pi-task logs RUN_ID
 pi-task resume-session RUN_ID
 ```
 
@@ -79,11 +80,11 @@ pi-task resume-session RUN_ID
 
 The wrapper enforces each task's timeout (default 30 minutes) and records `timed_out` runs. Generated services and manual transient units also set `RuntimeMaxSec` slightly above the task timeout so systemd can kill a hung wrapper as a backstop, and `TimeoutStopSec` so unit stop during cancel stays bounded. After upgrading, run `pi-task sync` so existing scheduled units pick up these service properties. Failed, cancelled, and timed-out runs retain discovered session paths when Pi wrote a session before exiting. pi-task does not automatically replay failed prompts.
 
-`runs` lists recorded status, duration, model, and session identifiers. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage. Sessions from failed, cancelled, and timed-out runs remain available once the run is no longer active.
+`runs` lists recorded status (scheduled/manual × succeeded/failed/skipped/cancelled/timed_out), start time, duration, model, thinking level, prompt hash, token usage, cost when available, session identifiers, and the supervising systemd unit and invocation when known. `logs RUN_ID` reads journald for that run: when the wrapper stored an `INVOCATION_ID`, selection is exact (including repeated activations of the same scheduled unit and collected transient manual units); otherwise it falls back to the supervising unit plus a tight time window (best-effort). If journal lines have expired or are missing, `logs` explains the gap without changing retained SQLite run history. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage. Sessions from failed, cancelled, and timed-out runs remain available once the run is no longer active.
 
 Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
 
-For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, `PI_TASK_SYSTEMD_RUN_EXECUTABLE`, `PI_TASK_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
+For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, `PI_TASK_SYSTEMD_RUN_EXECUTABLE`, `PI_TASK_EXECUTABLE`, `PI_TASK_JOURNALCTL_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
 
 ## Development
 
