@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Calendar task creation and inspection are available; running tasks is not yet implemented.
+> **Status:** Early development. Task scheduling lifecycle is available; running tasks is not yet implemented.
 
 ## Goals
 
@@ -28,7 +28,7 @@ pi-task doctor
 
 `doctor` reports required failures with a nonzero exit status. Disabled user lingering is an actionable warning because scheduled tasks can still run while the user is logged in.
 
-## Create a calendar task
+## Create a task
 
 Run `pi-task add` without arguments for guided creation, or provide all values for scripted use:
 
@@ -44,11 +44,27 @@ pi-task add daily-review \
   --trust inherit
 ```
 
-The command validates model availability in the systemd user-manager environment and validates the calendar expression, previews three occurrences, and asks for confirmation before writing the task definition and activating its user timer. Use exactly one of `--prompt` or `--prompt-file`, `--yes` for non-interactive confirmation, or `--paused` to create configuration and generated units without scheduling it. Inherited project trust emits a warning when Pi has no saved decision for the working directory or one of its parents.
+Use `--interval 15m` instead of `--calendar` for elapsed interval schedules. Intervals must be at least one minute and first fire one interval after activation. Calendar tasks enable catch-up after machine downtime by default (`--catch-up` / `--no-catch-up`); missed occurrences coalesce through systemd persistence. Interval schedules never replay missed time.
 
-Inspect tasks with `pi-task list` and `pi-task show TASK_ID`. Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
+The command validates model availability in the systemd user-manager environment, validates the schedule, previews upcoming calendar occurrences, and asks for confirmation before writing the task definition and activating its user timer. Use exactly one of `--prompt` or `--prompt-file`, exactly one of `--calendar` or `--interval`, `--yes` for non-interactive confirmation, or `--paused` to create configuration and generated units without scheduling it. Inherited project trust emits a warning when Pi has no saved decision for the working directory or one of its parents.
 
-For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
+## Manage tasks
+
+Inspect tasks with `pi-task list` and `pi-task show TASK_ID`.
+
+```console
+pi-task edit daily-review --thinking low --interval 1h
+pi-task pause daily-review
+pi-task resume daily-review
+pi-task sync
+pi-task remove daily-review --yes
+```
+
+`edit` validates the full resulting configuration and applies it atomically. Editing or resuming an interval restarts the interval from that moment. `pause` suppresses future scheduled runs without cancelling an active run and clears calendar persistence so paused occurrences are skipped. `resume` schedules only future occurrences. `sync` regenerates units from task definitions and removes generated orphan units. `remove` stops future scheduling and deletes the definition and generated units without touching run or session history.
+
+Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
+
+For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
 
 ## Development
 
