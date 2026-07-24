@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import uuid
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -94,6 +96,10 @@ def resolve_prompt_text(task: Task) -> tuple[str, str]:
     return text, digest
 
 
+def _glob_escape(value: str) -> str:
+    return re.sub(r"([*?\[])", r"[\1]", value)
+
+
 def find_session_path(
     session_id: str,
     timestamp: str | None = None,
@@ -101,6 +107,7 @@ def find_session_path(
 ) -> Path | None:
     """Locate the ordinary Pi session file without moving it."""
     sessions_root = _agent_dir() / "sessions"
+    safe_id = _glob_escape(session_id)
     if timestamp and cwd:
         safe_cwd = cwd.lstrip("/").replace("/", "-").replace("\\", "-").replace(":", "-")
         encoded = f"--{safe_cwd}--"
@@ -110,11 +117,11 @@ def find_session_path(
             return expected
         session_dir = expected.parent
         if session_dir.is_dir():
-            matches = sorted(session_dir.glob(f"*_{session_id}.jsonl"))
+            matches = sorted(session_dir.glob(f"*_{safe_id}.jsonl"))
             if matches:
                 return matches[-1]
     if sessions_root.is_dir():
-        matches = sorted(sessions_root.glob(f"**/*_{session_id}.jsonl"))
+        matches = sorted(sessions_root.glob(f"**/*_{safe_id}.jsonl"))
         if matches:
             return matches[-1]
     return None
@@ -148,6 +155,26 @@ def build_pi_command(
 
 def _log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+def _stop_process_group(process: subprocess.Popen[str], *, grace_seconds: float = 5.0) -> None:
+    """Terminate Pi and its process group, escalating to kill after a short grace period."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait()
 
 
 def _now() -> datetime:
@@ -205,7 +232,8 @@ def execute_task_run(task_id: str, *, source: RunSource) -> int:
         cancelled = True
         _log(f"run {run_id}: received signal {signum}; cancelling")
         if process is not None and process.poll() is None:
-            process.terminate()
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous_handlers.append((signum, signal.getsignal(signum)))
@@ -219,6 +247,7 @@ def execute_task_run(task_id: str, *, source: RunSource) -> int:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
         except OSError as exc:
             error = f"could not start Pi: {exc}"
@@ -237,11 +266,15 @@ def execute_task_run(task_id: str, *, source: RunSource) -> int:
             try:
                 stdout, stderr = process.communicate(timeout=task.timeout_seconds)
             except subprocess.TimeoutExpired:
-                timed_out = True
-                process.kill()
-                stdout, stderr = process.communicate()
-                error = f"timed out after {task.timeout_seconds} seconds"
-                _log(f"run {run_id}: {error}")
+                if cancelled:
+                    _stop_process_group(process)
+                    stdout, stderr = process.communicate()
+                else:
+                    timed_out = True
+                    _stop_process_group(process)
+                    stdout, stderr = process.communicate()
+                    error = f"timed out after {task.timeout_seconds} seconds"
+                    _log(f"run {run_id}: {error}")
             exit_code = process.returncode
             for line in stdout.splitlines():
                 consume_event_line(observation, line)
@@ -254,7 +287,7 @@ def execute_task_run(task_id: str, *, source: RunSource) -> int:
             error = f"wrapper failed: {exc}"
             _log(f"run {run_id}: {error}")
             if process.poll() is None:
-                process.kill()
+                _stop_process_group(process)
                 process.communicate()
             return _finalize(
                 run_id=run_id,
