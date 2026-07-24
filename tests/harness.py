@@ -54,6 +54,9 @@ def make_run_env(tmp_path: Path) -> dict[str, str]:
         "PI_TASK_SYSTEMD_RUN_EXECUTABLE",
         "PI_TASK_EXECUTABLE",
         "PI_TASK_JOURNALCTL_EXECUTABLE",
+        # GitHub Actions (and systemd units) set INVOCATION_ID; keep tests
+        # deterministic unless a case opts in by re-adding the variable.
+        "INVOCATION_ID",
     ):
         env.pop(variable, None)
     return env
