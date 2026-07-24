@@ -38,6 +38,7 @@ from pi_task.tasks import (
     TaskError,
     get_task,
     stop_user_unit,
+    supervising_unit,
     unit_name_for_run,
 )
 
@@ -479,7 +480,12 @@ def cancel_run(run_id: str) -> tuple[RunRecord, str]:
         )
 
     record = _require_running_run(run_id)
-    unit = unit_name_for_run(task_id=record.task_id, run_id=record.id, source=record.source)
+    unit = supervising_unit(
+        recorded_unit=record.unit_name,
+        task_id=record.task_id,
+        run_id=record.id,
+        source=record.source,
+    )
     # systemctl stop is synchronous for oneshot services; TimeoutStopSec bounds
     # the unit, and the client timeout sits above that.
     stop_user_unit(unit)

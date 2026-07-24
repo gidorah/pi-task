@@ -15,7 +15,10 @@ RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled", 
 
 _SCHEMA_VERSION = 2
 
-_MIGRATIONS: dict[int, str] = {
+# SQL migrations must be idempotent: executescript commits and connections use
+# isolation_level=None, so a crash between applying DDL and recording the version
+# must not brick the next open.
+_MIGRATIONS_SQL: dict[int, str] = {
     1: """
     CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
@@ -42,11 +45,27 @@ _MIGRATIONS: dict[int, str] = {
     CREATE INDEX IF NOT EXISTS idx_runs_task_started ON runs (task_id, started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_runs_started ON runs (started_at DESC);
     """,
-    2: """
-    ALTER TABLE runs ADD COLUMN unit_name TEXT;
-    ALTER TABLE runs ADD COLUMN invocation_id TEXT;
-    """,
 }
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_column_if_missing(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    if column not in _table_columns(connection, table):
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _migrate_v2(connection: sqlite3.Connection) -> None:
+    """Add unit/invocation identity columns without failing if already present."""
+    _add_column_if_missing(connection, "runs", "unit_name", "TEXT")
+    _add_column_if_missing(connection, "runs", "invocation_id", "TEXT")
 
 
 @dataclass(frozen=True)
@@ -127,7 +146,8 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    # executescript() issues its own commits, so migrations themselves must be idempotent.
+    # DDL steps commit independently under isolation_level=None; each version must
+    # be safe to re-run if the version row was not recorded.
     connection.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations ("
         "version INTEGER PRIMARY KEY NOT NULL,"
@@ -139,7 +159,12 @@ def migrate(connection: sqlite3.Connection) -> None:
     ).fetchone()
     applied = int(current[0]) if current is not None else 0
     for version in range(applied + 1, _SCHEMA_VERSION + 1):
-        connection.executescript(_MIGRATIONS[version])
+        if version in _MIGRATIONS_SQL:
+            connection.executescript(_MIGRATIONS_SQL[version])
+        elif version == 2:
+            _migrate_v2(connection)
+        else:
+            raise RuntimeError(f"missing migration for schema version {version}")
         connection.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
 
 
@@ -233,12 +258,8 @@ def finish_run(
     return cursor.rowcount > 0
 
 
-def _row_keys(row: sqlite3.Row) -> set[str]:
-    return set(row.keys())
-
-
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
-    keys = _row_keys(row)
+    # open_db always migrates before use; v2 columns are always present (may be NULL).
     return RunRecord(
         id=row["id"],
         task_id=row["task_id"],
@@ -260,8 +281,8 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
         cache_write_tokens=row["cache_write_tokens"],
         cost_total=row["cost_total"],
         error=row["error"],
-        unit_name=row["unit_name"] if "unit_name" in keys else None,
-        invocation_id=row["invocation_id"] if "invocation_id" in keys else None,
+        unit_name=row["unit_name"],
+        invocation_id=row["invocation_id"],
     )
 
 
