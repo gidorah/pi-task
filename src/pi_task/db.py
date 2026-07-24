@@ -6,7 +6,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Literal, cast
+
+RunSource = Literal["scheduled", "manual"]
+RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled"]
 
 _SCHEMA_VERSION = 1
 
@@ -44,8 +47,8 @@ _MIGRATIONS: dict[int, str] = {
 class RunRecord:
     id: str
     task_id: str
-    source: str
-    status: str
+    source: RunSource
+    status: RunStatus
     started_at: str
     finished_at: str | None
     duration_ms: int | None
@@ -56,6 +59,34 @@ class RunRecord:
     snapshot_json: str
     model: str
     thinking: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    cost_total: float | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class NewRun:
+    id: str
+    task_id: str
+    source: RunSource
+    started_at: str
+    session_name: str
+    prompt_hash: str
+    snapshot_json: str
+    model: str
+    thinking: str
+
+
+@dataclass(frozen=True)
+class RunCompletion:
+    status: RunStatus
+    finished_at: str
+    duration_ms: int
+    session_id: str | None
+    session_path: str | None
     input_tokens: int | None
     output_tokens: int | None
     cache_read_tokens: int | None
@@ -83,8 +114,7 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    # Keep autocommit off only for the version bookkeeping statements. executescript()
-    # issues its own commits, so migrations themselves must be idempotent.
+    # executescript() issues its own commits, so migrations themselves must be idempotent.
     connection.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations ("
         "version INTEGER PRIMARY KEY NOT NULL,"
@@ -110,20 +140,66 @@ def open_db(path: Path | None = None) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-def insert_run(connection: sqlite3.Connection, values: dict[str, Any]) -> None:
-    columns = ", ".join(values)
-    placeholders = ", ".join("?" for _ in values)
+def insert_run(connection: sqlite3.Connection, run: NewRun) -> None:
     connection.execute(
-        f"INSERT INTO runs ({columns}) VALUES ({placeholders})",
-        tuple(values.values()),
+        """
+        INSERT INTO runs (
+            id, task_id, source, status, started_at, finished_at, duration_ms,
+            session_id, session_path, session_name, prompt_hash, snapshot_json,
+            model, thinking, input_tokens, output_tokens, cache_read_tokens,
+            cache_write_tokens, cost_total, error
+        ) VALUES (
+            ?, ?, ?, 'running', ?, NULL, NULL,
+            NULL, NULL, ?, ?, ?,
+            ?, ?, NULL, NULL, NULL,
+            NULL, NULL, NULL
+        )
+        """,
+        (
+            run.id,
+            run.task_id,
+            run.source,
+            run.started_at,
+            run.session_name,
+            run.prompt_hash,
+            run.snapshot_json,
+            run.model,
+            run.thinking,
+        ),
     )
 
 
-def finish_run(connection: sqlite3.Connection, run_id: str, values: dict[str, Any]) -> None:
-    assignments = ", ".join(f"{column} = ?" for column in values)
+def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompletion) -> None:
     connection.execute(
-        f"UPDATE runs SET {assignments} WHERE id = ?",
-        (*values.values(), run_id),
+        """
+        UPDATE runs SET
+            status = ?,
+            finished_at = ?,
+            duration_ms = ?,
+            session_id = ?,
+            session_path = ?,
+            input_tokens = ?,
+            output_tokens = ?,
+            cache_read_tokens = ?,
+            cache_write_tokens = ?,
+            cost_total = ?,
+            error = ?
+        WHERE id = ?
+        """,
+        (
+            completion.status,
+            completion.finished_at,
+            completion.duration_ms,
+            completion.session_id,
+            completion.session_path,
+            completion.input_tokens,
+            completion.output_tokens,
+            completion.cache_read_tokens,
+            completion.cache_write_tokens,
+            completion.cost_total,
+            completion.error,
+            run_id,
+        ),
     )
 
 
@@ -131,8 +207,8 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
         id=row["id"],
         task_id=row["task_id"],
-        source=row["source"],
-        status=row["status"],
+        source=cast("RunSource", row["source"]),
+        status=cast("RunStatus", row["status"]),
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         duration_ms=row["duration_ms"],

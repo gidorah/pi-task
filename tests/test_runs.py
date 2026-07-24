@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +28,7 @@ def run_env(tmp_path: Path) -> dict[str, str]:
         r"""#!/usr/bin/env python3
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -332,3 +334,65 @@ def test_service_unit_invokes_wrapper_with_task_identity(
     _add_task(run_cli, run_env, "wired")
     service = (Path(run_env["XDG_CONFIG_HOME"]) / "systemd/user/pi-task-wired.service").read_text()
     assert "_run-scheduled wired --source scheduled" in service
+
+
+def test_scheduled_entrypoint_rejects_non_scheduled_source(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "source-check")
+    result = run_cli("_run-scheduled", "source-check", "--source", "manual", env=run_env)
+    assert result.returncode != 0
+    assert "requires --source scheduled" in result.stderr
+
+
+def test_sigterm_marks_run_cancelled(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+    tmp_path: Path,
+) -> None:
+    # Replace fake pi with a slow process that ignores nothing and dies on SIGTERM.
+    bin_dir = Path(run_env["PATH"].split(os.pathsep)[0])
+    slow = bin_dir / "pi"
+    slow.unlink()
+    slow.write_text(
+        """#!/usr/bin/env python3
+import json, os, signal, sys, time
+from pathlib import Path
+with Path(os.environ["FAKE_COMMAND_LOG"]).open("a") as log:
+    print(json.dumps(["pi", *sys.argv[1:]]), file=log)
+if "--list-models" in sys.argv:
+    print("provider model context\\nacme rocket 128K")
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+time.sleep(30)
+raise SystemExit(0)
+"""
+    )
+    slow.chmod(0o755)
+    _add_task(run_cli, run_env, "cancel-me")
+
+    proc = subprocess.Popen(
+        ["pi-task", "_run-scheduled", "cancel-me"],
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    # Wait until the wrapper has started Pi.
+    import time
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if Path(run_env["XDG_STATE_HOME"]).joinpath("pi-task/runs.db").is_file():
+            break
+        time.sleep(0.05)
+    time.sleep(0.2)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=10)
+    assert proc.returncode != 0, stdout + stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        status = connection.execute("SELECT status FROM runs").fetchone()[0]
+    assert status == "cancelled"

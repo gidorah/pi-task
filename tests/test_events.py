@@ -69,7 +69,12 @@ def test_consume_session_and_successful_assistant_completion() -> None:
     assert observation.usage.cache_write_tokens == 2
     assert observation.usage.cost_total == pytest.approx(0.3)
     assert (
-        classify_run_status(process_exit_code=0, timed_out=False, observation=observation)
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=observation,
+        )
         == "succeeded"
     )
 
@@ -97,7 +102,12 @@ def test_recovered_tool_error_does_not_override_final_success() -> None:
         ),
     )
     assert (
-        classify_run_status(process_exit_code=0, timed_out=False, observation=observation)
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=observation,
+        )
         == "succeeded"
     )
 
@@ -113,19 +123,39 @@ def test_length_exhaustion_and_missing_response_fail() -> None:
             }
         ),
     )
-    assert classify_run_status(process_exit_code=0, timed_out=False, observation=length) == "failed"
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=length,
+        )
+        == "failed"
+    )
 
     missing = StreamObservation()
     assert (
-        classify_run_status(process_exit_code=0, timed_out=False, observation=missing) == "failed"
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=missing,
+        )
+        == "failed"
     )
 
 
-def test_malformed_stream_timeout_and_process_error() -> None:
+def test_malformed_stream_timeout_cancel_and_process_error() -> None:
     malformed = StreamObservation()
     consume_event_line(malformed, "{not-json")
     assert (
-        classify_run_status(process_exit_code=0, timed_out=False, observation=malformed) == "failed"
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=malformed,
+        )
+        == "failed"
     )
 
     ok = StreamObservation()
@@ -133,5 +163,54 @@ def test_malformed_stream_timeout_and_process_error() -> None:
         ok,
         json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}}),
     )
-    assert classify_run_status(process_exit_code=0, timed_out=True, observation=ok) == "timed_out"
-    assert classify_run_status(process_exit_code=2, timed_out=False, observation=ok) == "failed"
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=True,
+            cancelled=False,
+            observation=ok,
+        )
+        == "timed_out"
+    )
+    assert (
+        classify_run_status(
+            process_exit_code=2,
+            timed_out=False,
+            cancelled=False,
+            observation=ok,
+        )
+        == "failed"
+    )
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=True,
+            observation=ok,
+        )
+        == "cancelled"
+    )
+    assert (
+        classify_run_status(
+            process_exit_code=143,
+            timed_out=False,
+            cancelled=True,
+            observation=ok,
+        )
+        == "cancelled"
+    )
+
+
+def test_find_session_path_can_use_session_id_alone(tmp_path, monkeypatch) -> None:
+    from pi_task import runner
+
+    agent = tmp_path / "agent"
+    session_dir = agent / "sessions" / "--tmp-project--"
+    session_dir.mkdir(parents=True)
+    session_id = "019f0000-aaaa-bbbb-cccc-ddddeeeeffff"
+    path = session_dir / f"2030-01-01T00-00-00-000Z_{session_id}.jsonl"
+    path.write_text("{}\n")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent))
+
+    found = runner.find_session_path(session_id)
+    assert found == path

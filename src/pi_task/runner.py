@@ -4,19 +4,26 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
-from pi_task.db import finish_run, insert_run, open_db
+from pi_task.db import (
+    NewRun,
+    RunCompletion,
+    RunSource,
+    RunStatus,
+    finish_run,
+    insert_run,
+    open_db,
+)
 from pi_task.events import StreamObservation, classify_run_status, consume_event_line
 from pi_task.tasks import Task, TaskError, get_task
-
-RunSource = Literal["scheduled", "manual"]
 
 
 @dataclass(frozen=True)
@@ -87,20 +94,25 @@ def resolve_prompt_text(task: Task) -> tuple[str, str]:
     return text, digest
 
 
-def find_session_path(session_id: str, timestamp: str, cwd: str) -> Path | None:
+def find_session_path(
+    session_id: str,
+    timestamp: str | None = None,
+    cwd: str | None = None,
+) -> Path | None:
     """Locate the ordinary Pi session file without moving it."""
-    safe_cwd = cwd.lstrip("/").replace("/", "-").replace("\\", "-").replace(":", "-")
-    encoded = f"--{safe_cwd}--"
-    file_timestamp = timestamp.replace(":", "-").replace(".", "-")
-    expected = _agent_dir() / "sessions" / encoded / f"{file_timestamp}_{session_id}.jsonl"
-    if expected.is_file():
-        return expected
-    session_dir = expected.parent
-    if session_dir.is_dir():
-        matches = sorted(session_dir.glob(f"*_{session_id}.jsonl"))
-        if matches:
-            return matches[-1]
     sessions_root = _agent_dir() / "sessions"
+    if timestamp and cwd:
+        safe_cwd = cwd.lstrip("/").replace("/", "-").replace("\\", "-").replace(":", "-")
+        encoded = f"--{safe_cwd}--"
+        file_timestamp = timestamp.replace(":", "-").replace(".", "-")
+        expected = sessions_root / encoded / f"{file_timestamp}_{session_id}.jsonl"
+        if expected.is_file():
+            return expected
+        session_dir = expected.parent
+        if session_dir.is_dir():
+            matches = sorted(session_dir.glob(f"*_{session_id}.jsonl"))
+            if matches:
+                return matches[-1]
     if sessions_root.is_dir():
         matches = sorted(sessions_root.glob(f"**/*_{session_id}.jsonl"))
         if matches:
@@ -146,10 +158,6 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def run_scheduled_task(task_id: str) -> int:
-    return execute_task_run(task_id, source="scheduled")
-
-
 def execute_task_run(task_id: str, *, source: RunSource) -> int:
     task = get_task(task_id)
     snapshot = TaskSnapshot.from_task(task)
@@ -162,28 +170,17 @@ def execute_task_run(task_id: str, *, source: RunSource) -> int:
     with open_db() as connection:
         insert_run(
             connection,
-            {
-                "id": run_id,
-                "task_id": task.task_id,
-                "source": source,
-                "status": "running",
-                "started_at": _iso(started),
-                "finished_at": None,
-                "duration_ms": None,
-                "session_id": None,
-                "session_path": None,
-                "session_name": session_name,
-                "prompt_hash": prompt_hash,
-                "snapshot_json": snapshot_json,
-                "model": snapshot.model,
-                "thinking": snapshot.thinking,
-                "input_tokens": None,
-                "output_tokens": None,
-                "cache_read_tokens": None,
-                "cache_write_tokens": None,
-                "cost_total": None,
-                "error": None,
-            },
+            NewRun(
+                id=run_id,
+                task_id=task.task_id,
+                source=source,
+                started_at=_iso(started),
+                session_name=session_name,
+                prompt_hash=prompt_hash,
+                snapshot_json=snapshot_json,
+                model=snapshot.model,
+                thinking=snapshot.thinking,
+            ),
         )
 
     _log(f"run {run_id}: starting {source} run for task {task.task_id}")
@@ -197,99 +194,144 @@ def execute_task_run(task_id: str, *, source: RunSource) -> int:
 
     observation = StreamObservation()
     timed_out = False
+    cancelled = False
     exit_code: int | None = None
     error: str | None = None
+    process: subprocess.Popen[str] | None = None
+    previous_handlers: list[tuple[signal.Signals, Any]] = []
+
+    def _request_cancel(signum: int, _frame: object) -> None:
+        nonlocal cancelled
+        cancelled = True
+        _log(f"run {run_id}: received signal {signum}; cancelling")
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous_handlers.append((signum, signal.getsignal(signum)))
+        signal.signal(signum, _request_cancel)
 
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(task.working_directory),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except OSError as exc:
-        error = f"could not start Pi: {exc}"
-        _log(f"run {run_id}: {error}")
-        return _finalize(
-            run_id=run_id,
-            started=started,
-            status="failed",
-            observation=observation,
-            error=error,
-        )
-
-    try:
-        assert process.stdout is not None
-        assert process.stderr is not None
         try:
-            stdout, stderr = process.communicate(timeout=task.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            stdout, stderr = process.communicate()
-            error = f"timed out after {task.timeout_seconds} seconds"
+            process = subprocess.Popen(
+                command,
+                cwd=str(task.working_directory),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            error = f"could not start Pi: {exc}"
             _log(f"run {run_id}: {error}")
-        exit_code = process.returncode
-        for line in stdout.splitlines():
-            consume_event_line(observation, line)
-        # Pi diagnostics stay out of journald duplication of the event stream; keep stderr brief.
-        if stderr.strip():
-            for line in stderr.splitlines():
-                if line.strip():
-                    _log(f"run {run_id}: pi: {line.strip()}")
-    except Exception as exc:
-        error = f"wrapper failed: {exc}"
-        _log(f"run {run_id}: {error}")
-        if process.poll() is None:
-            process.kill()
-            process.communicate()
+            return _finalize(
+                run_id=run_id,
+                started=started,
+                status="failed",
+                observation=observation,
+                error=error,
+            )
+
+        try:
+            assert process.stdout is not None
+            assert process.stderr is not None
+            try:
+                stdout, stderr = process.communicate(timeout=task.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+                stdout, stderr = process.communicate()
+                error = f"timed out after {task.timeout_seconds} seconds"
+                _log(f"run {run_id}: {error}")
+            exit_code = process.returncode
+            for line in stdout.splitlines():
+                consume_event_line(observation, line)
+            # Keep Pi diagnostics brief; never forward the JSON event stream.
+            if stderr.strip():
+                for line in stderr.splitlines():
+                    if line.strip():
+                        _log(f"run {run_id}: pi: {line.strip()}")
+        except Exception as exc:
+            error = f"wrapper failed: {exc}"
+            _log(f"run {run_id}: {error}")
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+            return _finalize(
+                run_id=run_id,
+                started=started,
+                status="failed",
+                observation=observation,
+                error=error,
+            )
+
+        status = classify_run_status(
+            process_exit_code=exit_code,
+            timed_out=timed_out,
+            cancelled=cancelled,
+            observation=observation,
+        )
+        if status == "cancelled":
+            error = error or "run cancelled"
+        elif status != "succeeded" and error is None:
+            if observation.final_stop_reason and observation.final_stop_reason != "stop":
+                error = f"final stop reason: {observation.final_stop_reason}"
+            elif observation.malformed_line:
+                error = "malformed Pi JSON event stream"
+            elif not observation.saw_assistant:
+                error = "missing final assistant response"
+            elif exit_code not in (0, None):
+                error = f"Pi exited with status {exit_code}"
+            else:
+                error = f"run ended with status {status}"
+
         return _finalize(
             run_id=run_id,
             started=started,
-            status="failed",
+            status=status,
             observation=observation,
             error=error,
         )
-
-    status = classify_run_status(
-        process_exit_code=exit_code,
-        timed_out=timed_out,
-        observation=observation,
-    )
-    if status != "succeeded" and error is None:
-        if observation.final_stop_reason and observation.final_stop_reason != "stop":
-            error = f"final stop reason: {observation.final_stop_reason}"
-        elif observation.malformed_line:
-            error = "malformed Pi JSON event stream"
-        elif not observation.saw_assistant:
-            error = "missing final assistant response"
-        elif exit_code not in (0, None):
-            error = f"Pi exited with status {exit_code}"
-        else:
-            error = f"run ended with status {status}"
-
-    return _finalize(
-        run_id=run_id,
-        started=started,
-        status=status,
-        observation=observation,
-        error=error,
-    )
+    except BaseException as exc:
+        # Ensure the run never remains stuck in "running" after wrapper death.
+        if isinstance(exc, Exception):
+            status: RunStatus = "cancelled" if cancelled else "failed"
+            error = error or f"wrapper interrupted: {exc}"
+            _log(f"run {run_id}: {error}")
+            return _finalize(
+                run_id=run_id,
+                started=started,
+                status=status,
+                observation=observation,
+                error=error,
+            )
+        status = "cancelled" if cancelled else "failed"
+        error = error or f"wrapper interrupted by {exc.__class__.__name__}"
+        _log(f"run {run_id}: {error}")
+        _finalize(
+            run_id=run_id,
+            started=started,
+            status=status,
+            observation=observation,
+            error=error,
+        )
+        raise
+    finally:
+        for signum, handler in previous_handlers:
+            signal.signal(signum, handler)
 
 
 def _finalize(
     *,
     run_id: str,
     started: datetime,
-    status: str,
+    status: RunStatus,
     observation: StreamObservation,
     error: str | None,
 ) -> int:
     finished = _now()
     duration_ms = max(0, int((finished - started).total_seconds() * 1000))
     session_path: str | None = None
-    if observation.session_id and observation.session_timestamp and observation.session_cwd:
+    if observation.session_id:
         found = find_session_path(
             observation.session_id,
             observation.session_timestamp,
@@ -307,19 +349,19 @@ def _finalize(
         finish_run(
             connection,
             run_id,
-            {
-                "status": status,
-                "finished_at": _iso(finished),
-                "duration_ms": duration_ms,
-                "session_id": observation.session_id,
-                "session_path": session_path,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_read_tokens": cache_read,
-                "cache_write_tokens": cache_write,
-                "cost_total": usage.cost_total,
-                "error": error,
-            },
+            RunCompletion(
+                status=status,
+                finished_at=_iso(finished),
+                duration_ms=duration_ms,
+                session_id=observation.session_id,
+                session_path=session_path,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                cost_total=usage.cost_total,
+                error=error,
+            ),
         )
 
     if observation.session_id:
@@ -333,5 +375,5 @@ def _finalize(
     if usage.cost_total is not None:
         usage_parts.append(f"cost={usage.cost_total}")
     usage_suffix = f" ({', '.join(usage_parts)})" if usage_parts else ""
-    _log(f"run {run_id}: {status} in {duration_ms}ms{usage_suffix}")
+    _log(f"run {run_id}: finished in {duration_ms}ms{usage_suffix}")
     return 0 if status == "succeeded" else 1

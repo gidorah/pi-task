@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
+
+TerminalRunStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
 
 
 @dataclass
@@ -64,7 +66,6 @@ def consume_event_line(observation: StreamObservation, line: str) -> None:
             observation.session_cwd = cwd
         return
 
-    event_type = event.get("type")
     if event_type == "message_end":
         message = event.get("message")
         if isinstance(message, dict):
@@ -92,7 +93,6 @@ def consume_event_line(observation: StreamObservation, line: str) -> None:
         for item in messages:
             if isinstance(item, dict):
                 _observe_assistant(observation, cast("dict[str, Any]", item), count_usage=True)
-        return
 
 
 def _observe_assistant(
@@ -117,8 +117,11 @@ def classify_run_status(
     *,
     process_exit_code: int | None,
     timed_out: bool,
+    cancelled: bool,
     observation: StreamObservation,
-) -> str:
+) -> TerminalRunStatus:
+    if cancelled:
+        return "cancelled"
     if timed_out:
         return "timed_out"
     if process_exit_code is None:

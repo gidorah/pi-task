@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Scheduled execution into resumable Pi sessions is available; manual runs and overlap protection are not yet implemented.
+> **Status:** Early development. Scheduled runs into resumable Pi sessions are available; manual runs and overlap protection are not yet implemented.
 
 ## Goals
 

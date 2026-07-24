@@ -12,7 +12,7 @@ from rich.table import Table
 
 from pi_task.db import get_run, list_runs, open_db
 from pi_task.doctor import run_doctor
-from pi_task.runner import RunSource, execute_task_run, resolve_pi
+from pi_task.runner import execute_task_run, resolve_pi
 from pi_task.tasks import (
     Task,
     TaskError,
@@ -400,15 +400,14 @@ def run_scheduled(
     source: str = typer.Option(
         "scheduled",
         "--source",
-        help="Run source recorded in history (scheduled or manual).",
+        help="Run source recorded in history. Scheduled services pass scheduled.",
     ),
 ) -> None:
-    """Run one task through the thin Pi wrapper (scheduled service entrypoint)."""
+    """Run one scheduled task through the thin Pi wrapper."""
     try:
-        if source not in {"scheduled", "manual"}:
-            raise TaskError("source must be scheduled or manual")
-        run_source: RunSource = "manual" if source == "manual" else "scheduled"
-        code = execute_task_run(task_id, source=run_source)
+        if source != "scheduled":
+            raise TaskError("scheduled service entrypoint requires --source scheduled")
+        code = execute_task_run(task_id, source="scheduled")
     except TaskError as error:
         _task_error(error)
         raise
