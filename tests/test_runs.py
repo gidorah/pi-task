@@ -466,6 +466,8 @@ def test_sigterm_marks_run_cancelled(
     tmp_path: Path,
 ) -> None:
     # Replace fake pi with a slow process that ignores nothing and dies on SIGTERM.
+    import time
+
     bin_dir = Path(run_env["PATH"].split(os.pathsep)[0])
     slow = bin_dir / "pi"
     slow.unlink()
@@ -485,6 +487,7 @@ raise SystemExit(0)
     )
     slow.chmod(0o755)
     _add_task(run_cli, run_env, "cancel-me")
+    _clear_commands(run_env)
 
     proc = subprocess.Popen(
         ["pi-task", "_run-scheduled", "cancel-me"],
@@ -493,20 +496,34 @@ raise SystemExit(0)
         stderr=subprocess.PIPE,
         text=True,
     )
-    # Wait until the wrapper has started Pi.
-    import time
-
-    deadline = time.time() + 5
+    # Wait until the wrapper has a running row and has started Pi (handlers installed).
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    deadline = time.time() + 10
+    started = False
     while time.time() < deadline:
-        if Path(run_env["XDG_STATE_HOME"]).joinpath("pi-task/runs.db").is_file():
-            break
+        if db_path.is_file():
+            with sqlite3.connect(db_path) as connection:
+                row = connection.execute("SELECT 1 FROM runs WHERE status = 'running'").fetchone()
+            if row is not None:
+                pi_commands = [
+                    command
+                    for command in _commands(run_env)
+                    if command[0] == "pi" and "--list-models" not in command
+                ]
+                if pi_commands:
+                    started = True
+                    break
         time.sleep(0.05)
-    time.sleep(0.2)
+    if not started:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise AssertionError(f"run never reached Pi: {stdout}{stderr}")
+
     proc.send_signal(signal.SIGTERM)
-    stdout, stderr = proc.communicate(timeout=10)
+    stdout, stderr = proc.communicate(timeout=15)
     assert proc.returncode != 0, stdout + stderr
 
-    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
     with sqlite3.connect(db_path) as connection:
-        status = connection.execute("SELECT status FROM runs").fetchone()[0]
-    assert status == "cancelled"
+        row = connection.execute("SELECT status FROM runs").fetchone()
+    assert row is not None, "run row missing after cancel"
+    assert row[0] == "cancelled"
