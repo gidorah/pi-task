@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -29,16 +30,18 @@ class CommandResult:
     error: str | None = None
 
 
-def _resolve_executable(
-    name: str, override_variable: str, *, path: str | None = None
-) -> str | None:
+def _explicit_executable(value: str) -> str | None:
+    candidate = Path(value).expanduser()
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate.absolute())
+    return None
+
+
+def _resolve_executable(name: str, override_variable: str) -> str | None:
     override = os.environ.get(override_variable)
     if override:
-        candidate = Path(override).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.absolute())
-        return None
-    return shutil.which(name, path=path)
+        return _explicit_executable(override)
+    return shutil.which(name)
 
 
 def _run(command: list[str], *, env: dict[str, str] | None = None) -> CommandResult:
@@ -74,6 +77,17 @@ def _platform_check() -> Check:
     return Check("Linux host", "FAIL", f"{sys.platform}; pi-task requires Linux with systemd")
 
 
+def _installed_cli_check() -> Check:
+    executable = shutil.which("pi-task")
+    if executable is None:
+        return Check(
+            "pi-task executable",
+            "FAIL",
+            "not found on PATH; reinstall with `uv tool install .`",
+        )
+    return Check("pi-task executable", "PASS", executable)
+
+
 def _pi_check() -> Check:
     executable = _resolve_executable("pi", "PI_TASK_PI_EXECUTABLE")
     if executable is None:
@@ -91,24 +105,102 @@ def _pi_check() -> Check:
     return Check("Pi executable", "PASS", detail)
 
 
-def _systemd_check() -> tuple[Check, str | None]:
+def _legacy_environment_value(value: str) -> str:
+    if not value.startswith("$'"):
+        return value
+    if not value.endswith("'"):
+        raise ValueError("unterminated quoted value")
+
+    decoded = bytearray()
+    contents = value[2:-1]
+    index = 0
+    escapes = {
+        "a": 7,
+        "b": 8,
+        "f": 12,
+        "n": 10,
+        "r": 13,
+        "s": 32,
+        "t": 9,
+        "v": 11,
+        "\\": 92,
+        "'": 39,
+        '"': 34,
+    }
+    while index < len(contents):
+        character = contents[index]
+        if character != "\\":
+            decoded.extend(character.encode())
+            index += 1
+            continue
+        index += 1
+        if index >= len(contents):
+            raise ValueError("trailing escape")
+        escape_code = contents[index]
+        index += 1
+        if escape_code in escapes:
+            decoded.append(escapes[escape_code])
+            continue
+        widths = {"x": 2, "u": 4, "U": 8}
+        width = widths.get(escape_code)
+        if width is None or index + width > len(contents):
+            raise ValueError(f"unsupported escape: \\{escape_code}")
+        codepoint = int(contents[index : index + width], 16)
+        index += width
+        if escape_code == "x":
+            decoded.append(codepoint)
+        else:
+            decoded.extend(chr(codepoint).encode())
+    return os.fsdecode(bytes(decoded))
+
+
+def _legacy_systemd_environment(output: str) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            raise ValueError("expected NAME=VALUE")
+        name, value = line.split("=", 1)
+        environment[name] = _legacy_environment_value(value)
+    return environment
+
+
+def _systemd_check() -> tuple[Check, dict[str, str] | None]:
     executable = _resolve_executable("systemctl", "PI_TASK_SYSTEMCTL_EXECUTABLE")
     if executable is None:
         return (
             Check("systemd user manager", "FAIL", "systemctl not found on PATH"),
             None,
         )
-    result = _run([executable, "--user", "show-environment"])
-    if result.returncode != 0:
-        reason = result.error or f"systemctl exited with status {result.returncode}"
+    result = _run([executable, "--user", "--output=json", "show-environment"])
+    if result.returncode == 0:
+        try:
+            decoded = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            return (
+                Check("systemd user manager", "FAIL", f"invalid environment output: {error}"),
+                None,
+            )
+        if not isinstance(decoded, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in decoded.items()
+        ):
+            return Check("systemd user manager", "FAIL", "invalid environment output"), None
+        return Check("systemd user manager", "PASS", "reachable"), decoded
+
+    legacy_result = _run([executable, "--user", "show-environment"])
+    if legacy_result.returncode != 0:
+        reason = legacy_result.error or f"systemctl exited with status {legacy_result.returncode}"
         return Check("systemd user manager", "FAIL", reason), None
-    return Check("systemd user manager", "PASS", "reachable"), result.stdout
+    try:
+        environment = _legacy_systemd_environment(legacy_result.stdout)
+    except (UnicodeError, ValueError) as error:
+        return Check("systemd user manager", "FAIL", f"invalid environment output: {error}"), None
+    return Check("systemd user manager", "PASS", "reachable (legacy output)"), environment
 
 
 def _manager_pi_check(
-    manager_environment: str | None,
+    variables: dict[str, str] | None,
 ) -> tuple[Check, str | None, dict[str, str] | None]:
-    if manager_environment is None:
+    if variables is None:
         return (
             Check(
                 "Pi in systemd environment",
@@ -119,7 +211,6 @@ def _manager_pi_check(
             None,
         )
 
-    variables = dict(line.split("=", 1) for line in manager_environment.splitlines() if "=" in line)
     process_override = os.environ.get("PI_TASK_PI_EXECUTABLE")
     manager_override = variables.get("PI_TASK_PI_EXECUTABLE")
     if process_override and manager_override != process_override:
@@ -133,9 +224,8 @@ def _manager_pi_check(
             variables,
         )
     if manager_override:
-        candidate = Path(manager_override).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            executable = str(candidate.absolute())
+        executable = _explicit_executable(manager_override)
+        if executable is not None:
             return (
                 Check("Pi in systemd environment", "PASS", f"configured as {executable}"),
                 executable,
@@ -228,16 +318,23 @@ def _xdg_path(variable: str, fallback: Path | None) -> Path | None:
     return fallback
 
 
-def _writable_check(name: str, path: Path | None, *, create: bool) -> Check:
+def _writable_check(name: str, path: Path | None) -> Check:
     if path is None:
         return Check(name, "FAIL", "XDG_RUNTIME_DIR is not set")
+
+    existing = path
+    while not os.path.lexists(existing) and existing != existing.parent:
+        existing = existing.parent
+    if not existing.is_dir():
+        return Check(name, "FAIL", f"{path} is blocked by {existing}, which is not a directory")
+
     try:
-        if create:
-            path.mkdir(parents=True, exist_ok=True)
-        elif not path.is_dir():
-            return Check(name, "FAIL", f"{path} does not exist or is not a directory")
-        with tempfile.NamedTemporaryFile(prefix=".pi-task-doctor-", dir=path):
-            pass
+        if path.is_dir():
+            with tempfile.NamedTemporaryFile(prefix=".pi-task-doctor-", dir=path):
+                pass
+        else:
+            with tempfile.TemporaryDirectory(prefix=".pi-task-doctor-", dir=existing):
+                pass
     except OSError as error:
         return Check(name, "FAIL", f"{path} is not writable: {error.strerror or error}")
     return Check(name, "PASS", str(path))
@@ -249,15 +346,12 @@ def _xdg_checks() -> list[Check]:
     state = _xdg_path("XDG_STATE_HOME", home / ".local" / "state")
     runtime = _xdg_path("XDG_RUNTIME_DIR", None)
     return [
-        _writable_check("XDG config location", config / "pi-task" if config else None, create=True),
-        _writable_check("XDG state location", state / "pi-task" if state else None, create=True),
-        _writable_check(
-            "XDG runtime location", runtime / "pi-task" if runtime else None, create=True
-        ),
+        _writable_check("XDG config location", config / "pi-task" if config else None),
+        _writable_check("XDG state location", state / "pi-task" if state else None),
+        _writable_check("XDG runtime location", runtime / "pi-task" if runtime else None),
         _writable_check(
             "systemd unit location",
             config / "systemd" / "user" if config else None,
-            create=True,
         ),
     ]
 
@@ -271,6 +365,7 @@ def collect_checks() -> list[Check]:
     return [
         _python_check(),
         _platform_check(),
+        _installed_cli_check(),
         pi_check,
         systemd_check,
         manager_pi_check,

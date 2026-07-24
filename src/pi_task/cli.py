@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from importlib.metadata import version
+
 import typer
 
-from pi_task import __version__
 from pi_task.doctor import run_doctor
 
 app = typer.Typer(
@@ -13,7 +14,7 @@ app = typer.Typer(
 
 def version_callback(value: bool) -> None:
     if value:
-        typer.echo(f"pi-task {__version__}")
+        typer.echo(f"pi-task {version('pi-task')}")
         raise typer.Exit()
 
 

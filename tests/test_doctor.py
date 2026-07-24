@@ -37,12 +37,20 @@ if name == "pi":
     print("pi 0.test")
     raise SystemExit(int(os.environ.get("FAKE_PI_EXIT", "0")))
 if name == "systemctl":
-    print(f"PATH={os.environ['FAKE_MANAGER_PATH']}")
+    environment = {"PATH": os.environ["FAKE_MANAGER_PATH"]}
     for variable in ("FAKE_COMMAND_LOG", "FAKE_MODELS", "FAKE_MODELS_EXIT"):
         if variable in os.environ:
-            print(f"{variable}={os.environ[variable]}")
+            environment[variable] = os.environ[variable]
     if "FAKE_MANAGER_PI_OVERRIDE" in os.environ:
-        print(f"PI_TASK_PI_EXECUTABLE={os.environ['FAKE_MANAGER_PI_OVERRIDE']}")
+        environment["PI_TASK_PI_EXECUTABLE"] = os.environ["FAKE_MANAGER_PI_OVERRIDE"]
+    if "--output=json" in sys.argv:
+        if os.environ.get("FAKE_JSON_UNSUPPORTED") == "1":
+            raise SystemExit(64)
+        print(json.dumps(environment))
+    else:
+        for variable, value in environment.items():
+            print(f"{variable}={value}")
+        print("QUOTED=$'value\\x20'")
     raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "0")))
 if name == "loginctl":
     print(os.environ.get("FAKE_LINGER", "yes"))
@@ -62,6 +70,12 @@ raise SystemExit(64)
     runtime.mkdir(parents=True)
 
     env = os.environ.copy()
+    for variable in (
+        "PI_TASK_PI_EXECUTABLE",
+        "PI_TASK_SYSTEMCTL_EXECUTABLE",
+        "PI_TASK_LOGINCTL_EXECUTABLE",
+    ):
+        env.pop(variable, None)
     env.update(
         {
             "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
@@ -99,6 +113,7 @@ def test_doctor_reports_a_ready_isolated_environment(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS  Python" in result.stdout
+    assert "PASS  pi-task executable" in result.stdout
     assert "PASS  Pi executable" in result.stdout
     assert "PASS  systemd user manager" in result.stdout
     assert "PASS  Pi models" in result.stdout
@@ -112,9 +127,25 @@ def test_doctor_reports_a_ready_isolated_environment(
         json.loads(line) for line in Path(doctor_env["FAKE_COMMAND_LOG"]).read_text().splitlines()
     ]
     assert ["pi", "--version"] in commands
-    assert ["systemctl", "--user", "show-environment"] in commands
+    assert ["systemctl", "--user", "--output=json", "show-environment"] in commands
     assert ["pi", "--list-models"] in commands
     assert any(command[:2] == ["loginctl", "show-user"] for command in commands)
+
+    assert not Path(doctor_env["XDG_CONFIG_HOME"]).exists()
+    assert not Path(doctor_env["XDG_STATE_HOME"]).exists()
+    assert not (Path(doctor_env["XDG_RUNTIME_DIR"]) / "pi-task").exists()
+
+
+def test_doctor_supports_systemd_without_json_environment_output(
+    doctor_env: dict[str, str],
+    run_doctor: Callable[[dict[str, str]], subprocess.CompletedProcess[str]],
+) -> None:
+    doctor_env["FAKE_JSON_UNSUPPORTED"] = "1"
+
+    result = run_doctor(doctor_env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS  systemd user manager: reachable (legacy output)" in result.stdout
 
 
 def test_doctor_returns_failure_when_a_required_capability_is_missing(
