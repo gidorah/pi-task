@@ -562,7 +562,7 @@ def test_stale_lock_does_not_block_future_runs(
     _add_task(run_cli, lock_env, "recover")
     runtime = Path(lock_env["XDG_RUNTIME_DIR"]) / "pi-task" / "locks"
     (runtime / "task").mkdir(parents=True)
-    (runtime / "cwd").mkdir(parents=True)
+    (runtime / "working-directory").mkdir(parents=True)
     (runtime / "task" / "recover.lock").write_text("stale")
 
     _clear_commands(lock_env)
@@ -573,4 +573,68 @@ def test_stale_lock_does_not_block_future_runs(
     recovered = run_cli("_run-scheduled", "recover", env=_immediate_env(lock_env, "recover"))
     assert recovered.returncode == 0, recovered.stdout + recovered.stderr
     rows = _db_rows(lock_env)
-    assert any(row[2] == "succeeded" for row in rows)
+    statuses = sorted(row[2] for row in rows)
+    assert "succeeded" in statuses
+    # Interrupted wrapper row must not stay running forever.
+    assert "running" not in statuses
+    assert any(row[2] == "failed" and row[4] and "abandon" in row[4].lower() for row in rows)
+
+
+def test_run_keeps_startup_snapshot_after_task_remove(
+    lock_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, lock_env, "remove-me", prompt="Keep this prompt.")
+    _clear_commands(lock_env)
+
+    first = _start_gated_run(lock_env, "remove-me")
+    try:
+        removed = run_cli("remove", "remove-me", "--yes", env=lock_env)
+        assert removed.returncode == 0, removed.stdout + removed.stderr
+        assert not (Path(lock_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/remove-me.toml").is_file()
+    finally:
+        _release_gate(lock_env)
+        stdout, stderr = first.communicate(timeout=15)
+        assert first.returncode == 0, stdout + stderr
+
+    rows = _db_rows(lock_env)
+    assert len(rows) == 1
+    _task_id, _source, status, _session_id, _error, snapshot_json, _model = rows[0]
+    assert status == "succeeded"
+    snapshot = json.loads(snapshot_json)
+    assert snapshot["prompt"] == "Keep this prompt."
+    assert snapshot["task_id"] == "remove-me"
+
+
+def test_resume_session_heals_orphaned_running_row(
+    lock_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """After a killed wrapper, resume-session should not forever treat the run as active."""
+    _add_task(run_cli, lock_env, "orphan-resume")
+    _clear_commands(lock_env)
+
+    first = _start_gated_run(lock_env, "orphan-resume")
+    db_path = Path(lock_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    deadline = time.time() + 10
+    run_id = None
+    while time.time() < deadline:
+        if db_path.is_file():
+            with sqlite3.connect(db_path) as connection:
+                row = connection.execute("SELECT id FROM runs WHERE status = 'running'").fetchone()
+            if row is not None:
+                run_id = row[0]
+                break
+        time.sleep(0.05)
+    assert run_id is not None
+    first.send_signal(signal.SIGKILL)
+    first.wait(timeout=5)
+
+    # No session was finalized; heal must clear running so the refusal is not permanent.
+    refused_or_missing = run_cli("resume-session", run_id, env=lock_env)
+    assert refused_or_missing.returncode != 0
+    assert "active" not in refused_or_missing.stderr.lower()
+    with sqlite3.connect(db_path) as connection:
+        status = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    assert status is not None
+    assert status[0] != "running"
