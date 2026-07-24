@@ -30,6 +30,7 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 name = Path(sys.argv[0]).name
@@ -85,17 +86,22 @@ if name == "pi":
     user_message = {"type": "message", "message": {
         "role": "user", "content": "hi", "timestamp": 1,
     }}
-    session_path.write_text(
-        json.dumps(header) + "\n"
-        + json.dumps(user_message) + "\n"
-        + json.dumps({"type": "message", "message": assistant}) + "\n"
-    )
+    partial_only = os.environ.get("FAKE_PI_PARTIAL_SESSION") == "1"
+    session_body = json.dumps(header) + "\n" + json.dumps(user_message) + "\n"
+    if not partial_only:
+        session_body += json.dumps({"type": "message", "message": assistant}) + "\n"
+    session_path.write_text(session_body)
     print(json.dumps(header), flush=True)
     print(json.dumps({"type": "agent_start"}), flush=True)
-    print(json.dumps({"type": "message_end", "message": assistant}), flush=True)
-    print(json.dumps({"type": "agent_end", "messages": [assistant]}), flush=True)
+    if not partial_only:
+        print(json.dumps({"type": "message_end", "message": assistant}), flush=True)
+        print(json.dumps({"type": "agent_end", "messages": [assistant]}), flush=True)
     if os.environ.get("FAKE_PI_STDERR"):
         print(os.environ["FAKE_PI_STDERR"], file=sys.stderr)
+    sleep_for = float(os.environ.get("FAKE_PI_SLEEP", "0"))
+    if sleep_for > 0:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        time.sleep(sleep_for)
     raise SystemExit(int(os.environ.get("FAKE_PI_EXIT", "0")))
 
 if name == "systemd-analyze":
@@ -126,6 +132,28 @@ if name == "systemctl":
         raise SystemExit(0)
     if "is-active" in sys.argv:
         print("active")
+        raise SystemExit(0)
+    if "stop" in sys.argv:
+        # Tests can point cancel at a live wrapper PID started outside systemd.
+        # Wait for exit the way real systemctl stop waits for the unit.
+        stop_pid = os.environ.get("FAKE_SYSTEMCTL_STOP_PID")
+        if stop_pid:
+            try:
+                pid = int(stop_pid)
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(400):
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            except (ProcessLookupError, ValueError):
+                pass
         raise SystemExit(0)
     raise SystemExit(0)
 if name == "systemd-run":
@@ -208,6 +236,8 @@ def _add_task(
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
     env: dict[str, str],
     task_id: str = "daily-review",
+    *,
+    timeout: str = "20m",
 ) -> None:
     result = run_cli(
         "add",
@@ -225,7 +255,7 @@ def _add_task(
         "--thinking",
         "high",
         "--timeout",
-        "20m",
+        timeout,
         "--trust",
         "deny",
         "--yes",
@@ -353,6 +383,8 @@ def test_service_unit_invokes_wrapper_with_task_identity(
     _add_task(run_cli, run_env, "wired")
     service = (Path(run_env["XDG_CONFIG_HOME"]) / "systemd/user/pi-task-wired.service").read_text()
     assert "_run-scheduled wired --source scheduled" in service
+    # 20m timeout (1200s) + 120s hung-wrapper grace
+    assert "RuntimeMaxSec=1320" in service
 
 
 def test_scheduled_entrypoint_rejects_unknown_source(
@@ -389,6 +421,7 @@ def test_run_waits_records_manual_source_and_reports_status(
     assert unit_args[0].startswith("--unit=pi-task-run-manual-wait-")
     # Full UUID hex suffix (32 chars) keeps unit names unique without hyphens.
     assert len(unit_args[0].removeprefix("--unit=pi-task-run-manual-wait-")) == 32
+    assert "--property=RuntimeMaxSec=1320" in invocation
     assert "_run-scheduled" in invocation
     assert "manual-wait" in invocation
     source_index = invocation.index("--source")
@@ -461,32 +494,32 @@ def test_run_unknown_task_fails_without_starting_service(
     assert [command for command in commands if command[0] == "systemd-run"] == []
 
 
+def _wait_for_running_run(env: dict[str, str], *, timeout: float = 10.0) -> str:
+    import time
+
+    db_path = Path(env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if db_path.is_file():
+            with sqlite3.connect(db_path) as connection:
+                row = connection.execute("SELECT id FROM runs WHERE status = 'running'").fetchone()
+            if row is not None:
+                pi_commands = [
+                    command
+                    for command in _commands(env)
+                    if command[0] == "pi" and "--list-models" not in command
+                ]
+                if pi_commands:
+                    return str(row[0])
+        time.sleep(0.05)
+    raise AssertionError("run never reached Pi with a running history row")
+
+
 def test_sigterm_marks_run_cancelled(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
-    tmp_path: Path,
 ) -> None:
-    # Replace fake pi with a slow process that ignores nothing and dies on SIGTERM.
-    import time
-
-    bin_dir = Path(run_env["PATH"].split(os.pathsep)[0])
-    slow = bin_dir / "pi"
-    slow.unlink()
-    slow.write_text(
-        """#!/usr/bin/env python3
-import json, os, signal, sys, time
-from pathlib import Path
-with Path(os.environ["FAKE_COMMAND_LOG"]).open("a") as log:
-    print(json.dumps(["pi", *sys.argv[1:]]), file=log)
-if "--list-models" in sys.argv:
-    print("provider model context\\nacme rocket 128K")
-    raise SystemExit(0)
-signal.signal(signal.SIGTERM, signal.SIG_DFL)
-time.sleep(30)
-raise SystemExit(0)
-"""
-    )
-    slow.chmod(0o755)
+    run_env = {**run_env, "FAKE_PI_SLEEP": "30", "FAKE_PI_PARTIAL_SESSION": "1"}
     _add_task(run_cli, run_env, "cancel-me")
     _clear_commands(run_env)
 
@@ -497,34 +530,230 @@ raise SystemExit(0)
         stderr=subprocess.PIPE,
         text=True,
     )
-    # Wait until the wrapper has a running row and has started Pi (handlers installed).
-    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
-    deadline = time.time() + 10
-    started = False
-    while time.time() < deadline:
-        if db_path.is_file():
-            with sqlite3.connect(db_path) as connection:
-                row = connection.execute("SELECT 1 FROM runs WHERE status = 'running'").fetchone()
-            if row is not None:
-                pi_commands = [
-                    command
-                    for command in _commands(run_env)
-                    if command[0] == "pi" and "--list-models" not in command
-                ]
-                if pi_commands:
-                    started = True
-                    break
-        time.sleep(0.05)
-    if not started:
+    try:
+        _wait_for_running_run(run_env)
+    except AssertionError:
         proc.kill()
         stdout, stderr = proc.communicate(timeout=5)
-        raise AssertionError(f"run never reached Pi: {stdout}{stderr}")
+        raise AssertionError(f"run never reached Pi: {stdout}{stderr}") from None
 
     proc.send_signal(signal.SIGTERM)
     stdout, stderr = proc.communicate(timeout=15)
     assert proc.returncode != 0, stdout + stderr
 
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
     with sqlite3.connect(db_path) as connection:
-        row = connection.execute("SELECT status FROM runs").fetchone()
+        row = connection.execute(
+            "SELECT status, session_id, session_path, error FROM runs"
+        ).fetchone()
     assert row is not None, "run row missing after cancel"
-    assert row[0] == "cancelled"
+    status, session_id, session_path, error = row
+    assert status == "cancelled"
+    assert session_id == "019f0000-1111-2222-3333-444455556666"
+    assert session_path is not None and Path(session_path).is_file()
+    assert error and "cancel" in error.lower()
+
+
+def test_wrapper_timeout_records_timed_out_with_partial_session(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    run_env = {
+        **run_env,
+        "FAKE_PI_SLEEP": "30",
+        "FAKE_PI_PARTIAL_SESSION": "1",
+        "FAKE_SESSION_ID": "019f0000-tttt-tttt-tttt-tttttttttttt",
+    }
+    _add_task(run_cli, run_env, "timeout-me", timeout="1s")
+    _clear_commands(run_env)
+
+    executed = run_cli("_run-scheduled", "timeout-me", env=run_env)
+    assert executed.returncode != 0, executed.stdout + executed.stderr
+    assert "timed out" in executed.stderr.lower()
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        status, session_id, session_path, error = connection.execute(
+            "SELECT status, session_id, session_path, error FROM runs"
+        ).fetchone()
+    assert status == "timed_out"
+    assert session_id == "019f0000-tttt-tttt-tttt-tttttttttttt"
+    assert session_path is not None and Path(session_path).is_file()
+    assert error and "timed out" in error.lower()
+
+    # Partial timed-out sessions remain openable through resume-session.
+    with sqlite3.connect(db_path) as connection:
+        run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
+    resumed = run_cli("resume-session", run_id, env=run_env)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+
+
+def test_failed_run_keeps_partial_session_and_classifies_stop_reasons(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    run_env = {
+        **run_env,
+        "FAKE_STOP_REASON": "length",
+        "FAKE_SESSION_ID": "019f0000-ffff-ffff-ffff-ffffffffffff",
+    }
+    _add_task(run_cli, run_env, "fail-length")
+    _clear_commands(run_env)
+
+    executed = run_cli("_run-scheduled", "fail-length", env=run_env)
+    assert executed.returncode != 0, executed.stdout + executed.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        status, session_id, session_path, error = connection.execute(
+            "SELECT status, session_id, session_path, error FROM runs"
+        ).fetchone()
+    assert status == "failed"
+    assert session_id == "019f0000-ffff-ffff-ffff-ffffffffffff"
+    assert session_path is not None and Path(session_path).is_file()
+    assert error and "length" in error.lower()
+
+    with sqlite3.connect(db_path) as connection:
+        run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
+    resumed = run_cli("resume-session", run_id, env=run_env)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+
+
+def test_cancel_stops_active_scheduled_run_through_systemd_unit(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    import time
+
+    run_env = {**run_env, "FAKE_PI_SLEEP": "30", "FAKE_PI_PARTIAL_SESSION": "1"}
+    _add_task(run_cli, run_env, "stop-me")
+    _clear_commands(run_env)
+
+    proc = subprocess.Popen(
+        ["pi-task", "_run-scheduled", "stop-me"],
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        run_id = _wait_for_running_run(run_env)
+    except AssertionError:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise AssertionError(f"run never reached Pi: {stdout}{stderr}") from None
+
+    cancel_env = {**run_env, "FAKE_SYSTEMCTL_STOP_PID": str(proc.pid)}
+    _clear_commands(cancel_env)
+    cancelled = run_cli("cancel", run_id, env=cancel_env)
+    stdout, stderr = proc.communicate(timeout=15)
+    assert cancelled.returncode == 0, cancelled.stdout + cancelled.stderr
+    assert "Cancelled" in cancelled.stdout
+    assert "pi-task-stop-me.service" in cancelled.stdout
+    assert proc.returncode != 0, stdout + stderr
+
+    stop_commands = [
+        command
+        for command in _commands(cancel_env)
+        if command[0] == "systemctl" and "stop" in command
+    ]
+    assert stop_commands == [
+        ["systemctl", "--user", "stop", "pi-task-stop-me.service"],
+    ]
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    deadline = time.time() + 5
+    status = None
+    while time.time() < deadline:
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                "SELECT status, session_path FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is not None and row[0] != "running":
+            status, session_path = row
+            break
+        time.sleep(0.05)
+    assert status == "cancelled"
+    assert session_path is not None and Path(session_path).is_file()
+
+
+def test_cancel_stops_active_manual_run_unit(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    import time
+    import uuid
+
+    run_env = {**run_env, "FAKE_PI_SLEEP": "30", "FAKE_PI_PARTIAL_SESSION": "1"}
+    _add_task(run_cli, run_env, "manual-stop")
+    run_id = str(uuid.uuid4())
+    _clear_commands(run_env)
+
+    proc = subprocess.Popen(
+        [
+            "pi-task",
+            "_run-scheduled",
+            "manual-stop",
+            "--source",
+            "manual",
+            "--run-id",
+            run_id,
+        ],
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert _wait_for_running_run(run_env) == run_id
+    except AssertionError:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise AssertionError(f"run never reached Pi: {stdout}{stderr}") from None
+
+    cancel_env = {**run_env, "FAKE_SYSTEMCTL_STOP_PID": str(proc.pid)}
+    _clear_commands(cancel_env)
+    cancelled = run_cli("cancel", run_id, env=cancel_env)
+    proc.communicate(timeout=15)
+    assert cancelled.returncode == 0, cancelled.stdout + cancelled.stderr
+    expected_unit = f"pi-task-run-manual-stop-{run_id.replace('-', '')}.service"
+    assert expected_unit in cancelled.stdout
+
+    stop_commands = [
+        command
+        for command in _commands(cancel_env)
+        if command[0] == "systemctl" and "stop" in command
+    ]
+    assert stop_commands == [["systemctl", "--user", "stop", expected_unit]]
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    deadline = time.time() + 5
+    status = None
+    while time.time() < deadline:
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None and row[0] != "running":
+            status = row[0]
+            break
+        time.sleep(0.05)
+    assert status == "cancelled"
+
+
+def test_cancel_rejects_inactive_and_missing_runs(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "idle-cancel")
+    finished = run_cli("_run-scheduled", "idle-cancel", env=run_env)
+    assert finished.returncode == 0, finished.stdout + finished.stderr
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
+
+    inactive = run_cli("cancel", run_id, env=run_env)
+    assert inactive.returncode != 0
+    assert "not active" in inactive.stderr.lower()
+
+    missing = run_cli("cancel", "00000000-0000-0000-0000-000000000000", env=run_env)
+    assert missing.returncode != 0
+    assert "does not exist" in missing.stderr.lower()

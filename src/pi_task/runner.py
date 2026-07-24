@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -335,7 +336,9 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
         cancelled = True
         _log(f"run {run_id}: received signal {signum}; cancelling")
         if process is not None and process.poll() is None:
-            with suppress(ProcessLookupError):
+            # Best-effort async stop from a signal handler: TERM only here.
+            # The main thread escalates via _stop_process_group after communicate.
+            with suppress(ProcessLookupError, PermissionError, OSError):
                 os.killpg(process.pid, signal.SIGTERM)
 
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -366,23 +369,34 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
         try:
             assert process.stdout is not None
             assert process.stderr is not None
-            try:
-                stdout, stderr = process.communicate(timeout=task.timeout_seconds)
-            except subprocess.TimeoutExpired:
+            # Poll in short slices so a SIGTERM cancel flag is observed promptly.
+            # A single long communicate() can delay signal handling until timeout.
+            deadline = time.monotonic() + task.timeout_seconds
+            stdout = ""
+            stderr = ""
+            while True:
                 if cancelled:
                     _stop_process_group(process)
                     stdout, stderr = process.communicate()
-                else:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     timed_out = True
                     _stop_process_group(process)
                     stdout, stderr = process.communicate()
                     error = f"timed out after {task.timeout_seconds} seconds"
                     _log(f"run {run_id}: {error}")
+                    break
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.25, max(remaining, 0.01)))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
             exit_code = process.returncode
-            for line in stdout.splitlines():
+            for line in (stdout or "").splitlines():
                 consume_event_line(observation, line)
             # Keep Pi diagnostics brief; never forward the JSON event stream.
-            if stderr.strip():
+            if (stderr or "").strip():
                 for line in stderr.splitlines():
                     if line.strip():
                         _log(f"run {run_id}: pi: {line.strip()}")

@@ -17,6 +17,7 @@ from pi_task.tasks import (
     Task,
     TaskError,
     all_tasks,
+    cancel_run,
     create_task,
     get_task,
     has_saved_project_trust,
@@ -457,6 +458,28 @@ def run_task(
         typer.echo(f"Error: {detail}", err=True)
         raise typer.Exit(code=1)
     _echo_run_summary(record)
+    raise typer.Exit(code=0 if record.status == "succeeded" else 1)
+
+
+@app.command()
+def cancel(run_id: str = typer.Argument(..., help="Active run ID to stop.")) -> None:
+    """Stop an active scheduled or manual run through its systemd unit."""
+    try:
+        record, unit = cancel_run(run_id)
+    except TaskError as error:
+        _task_error(error)
+        raise
+    if record.status == "cancelled":
+        typer.echo(f"Cancelled run {run_id} (unit {unit}).")
+        raise typer.Exit()
+    if record.status == "running":
+        typer.echo(
+            f"Stop requested for run {run_id} (unit {unit}); "
+            "the run has not yet recorded a terminal status.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Stopped run {run_id} (unit {unit}); status: {record.status}.")
     raise typer.Exit(code=0 if record.status == "succeeded" else 1)
 
 

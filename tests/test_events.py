@@ -145,6 +145,28 @@ def test_length_exhaustion_and_missing_response_fail() -> None:
     )
 
 
+def test_unresolved_terminal_tool_use_fails() -> None:
+    observation = StreamObservation()
+    consume_event_line(
+        observation,
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "toolUse"},
+            }
+        ),
+    )
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=observation,
+        )
+        == "failed"
+    )
+
+
 def test_malformed_stream_timeout_cancel_and_process_error() -> None:
     malformed = StreamObservation()
     consume_event_line(malformed, "{not-json")
