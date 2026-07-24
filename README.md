@@ -10,7 +10,7 @@ Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 - Per-task model and thinking-level selection
 - Persistent, resumable Pi sessions
 - Pause, resume, and independent manual runs
-- Local execution through systemd user services
+- Local runs through systemd user services
 - Task and run management through a friendly CLI
 
 ## Platform
@@ -44,7 +44,7 @@ pi-task add daily-review \
   --trust inherit
 ```
 
-The command validates the model and systemd calendar expression, previews three occurrences, and asks for confirmation before writing the task definition and activating its user timer. Use exactly one of `--prompt` or `--prompt-file`, `--yes` for non-interactive confirmation, or `--paused` to create configuration and generated units without scheduling it.
+The command validates model availability in the systemd user-manager environment and validates the calendar expression, previews three occurrences, and asks for confirmation before writing the task definition and activating its user timer. Use exactly one of `--prompt` or `--prompt-file`, `--yes` for non-interactive confirmation, or `--paused` to create configuration and generated units without scheduling it. Inherited project trust emits a warning when Pi has no saved decision for the working directory or one of its parents.
 
 Inspect tasks with `pi-task list` and `pi-task show TASK_ID`. Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
 

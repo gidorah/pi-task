@@ -164,7 +164,7 @@ def _legacy_systemd_environment(output: str) -> dict[str, str]:
     return environment
 
 
-def _systemd_check() -> tuple[Check, dict[str, str] | None]:
+def systemd_environment_check() -> tuple[Check, dict[str, str] | None]:
     executable = _resolve_executable("systemctl", "PI_TASK_SYSTEMCTL_EXECUTABLE")
     if executable is None:
         return (
@@ -197,7 +197,7 @@ def _systemd_check() -> tuple[Check, dict[str, str] | None]:
     return Check("systemd user manager", "PASS", "reachable (legacy output)"), environment
 
 
-def _manager_pi_check(
+def manager_pi_check(
     variables: dict[str, str] | None,
 ) -> tuple[Check, str | None, dict[str, str] | None]:
     if variables is None:
@@ -358,8 +358,8 @@ def _xdg_checks() -> list[Check]:
 
 def collect_checks() -> list[Check]:
     pi_check = _pi_check()
-    systemd_check, manager_environment = _systemd_check()
-    manager_pi_check, manager_pi_executable, manager_variables = _manager_pi_check(
+    systemd_check, manager_environment = systemd_environment_check()
+    manager_pi_status, manager_pi_executable, manager_variables = manager_pi_check(
         manager_environment
     )
     return [
@@ -368,7 +368,7 @@ def collect_checks() -> list[Check]:
         _installed_cli_check(),
         pi_check,
         systemd_check,
-        manager_pi_check,
+        manager_pi_status,
         _models_check(manager_pi_executable, manager_variables),
         _lingering_check(),
         *_xdg_checks(),

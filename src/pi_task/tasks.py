@@ -14,6 +14,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Literal, cast
 
+from pi_task.doctor import manager_pi_check, systemd_environment_check
+
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 TRUST_POLICIES = ("inherit", "approve", "deny")
 _TASK_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -45,6 +47,12 @@ class CalendarPreview:
     occurrences: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SchedulingState:
+    summary: str
+    detail: str
+
+
 def _config_home() -> Path:
     value = os.environ.get("XDG_CONFIG_HOME")
     return Path(value).expanduser() if value else Path.home() / ".config"
@@ -71,7 +79,9 @@ def _resolve_executable(name: str, override: str) -> str:
     return executable
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    command: list[str], *, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             command,
@@ -79,7 +89,7 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, "LC_ALL": "C"},
+            env={**(environment if environment is not None else os.environ), "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise TaskError(f"could not run {command[0]}: {error}") from error
@@ -108,18 +118,25 @@ def parse_timeout(value: str) -> int:
 def validate_model(model: str) -> None:
     if model.count("/") != 1 or any(character.isspace() for character in model):
         raise TaskError("model must use the explicit provider/model form")
-    executable = _resolve_executable("pi", "PI_TASK_PI_EXECUTABLE")
-    result = _run([executable, "--list-models"])
+    systemd_status, manager_environment = systemd_environment_check()
+    if manager_environment is None:
+        raise TaskError(
+            f"could not inspect models in the systemd user manager: {systemd_status.detail}"
+        )
+    pi_status, executable, manager_environment = manager_pi_check(manager_environment)
+    if executable is None or manager_environment is None:
+        raise TaskError(f"could not inspect models in the systemd user manager: {pi_status.detail}")
+    result = _run([executable, "--list-models"], environment=manager_environment)
     if result.returncode != 0:
         detail = result.stderr.strip() or f"Pi exited with status {result.returncode}"
-        raise TaskError(f"could not list available Pi models: {detail}")
+        raise TaskError(f"could not list models in the systemd user manager: {detail}")
     available = {
         f"{columns[0]}/{columns[1]}"
         for line in result.stdout.splitlines()[1:]
         if len(columns := line.split()) >= 2
     }
     if model not in available:
-        raise TaskError(f"model {model!r} is not available from Pi")
+        raise TaskError(f"model {model!r} is not available to the systemd user manager")
 
 
 def _parse_occurrence(value: str) -> datetime | None:
@@ -168,6 +185,10 @@ def validate_task(task: Task) -> CalendarPreview:
         raise TaskError("display name must be a single line")
     if not task.working_directory.is_dir():
         raise TaskError(f"working directory does not exist: {task.working_directory}")
+    if any(
+        ord(character) < 32 or ord(character) == 127 for character in str(task.working_directory)
+    ):
+        raise TaskError("working directory contains control characters")
     if task.prompt_kind == "inline":
         if not task.prompt:
             raise TaskError("inline prompt must not be empty")
@@ -181,6 +202,32 @@ def validate_task(task: Task) -> CalendarPreview:
         raise TaskError(f"trust must be one of: {', '.join(TRUST_POLICIES)}")
     validate_model(task.model)
     return validate_calendar(task.calendar)
+
+
+def has_saved_project_trust(working_directory: Path) -> bool:
+    configured_agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    agent_dir = (
+        Path(configured_agent_dir).expanduser()
+        if configured_agent_dir
+        else Path.home() / ".pi" / "agent"
+    )
+    trust_path = agent_dir / "trust.json"
+    try:
+        with trust_path.open() as stream:
+            decisions = json.load(stream)
+    except OSError, json.JSONDecodeError:
+        return False
+    if not isinstance(decisions, dict):
+        return False
+
+    current = working_directory.resolve()
+    while True:
+        decision = decisions.get(str(current))
+        if isinstance(decision, bool):
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
 
 
 def _toml_string(value: str) -> str:
@@ -349,20 +396,24 @@ def all_tasks() -> list[Task]:
     return [load_task(path) for path in sorted(directory.glob("*.toml"))]
 
 
-def scheduling_state(task: Task) -> tuple[str, str]:
+def scheduling_state(task: Task) -> SchedulingState:
     unit = f"pi-task-{task.task_id}.timer"
     try:
         enabled = _systemctl("is-enabled", unit, allowed_statuses=(0, 1, 3, 4))
         active = _systemctl("is-active", unit, allowed_statuses=(0, 1, 3, 4))
     except TaskError:
         if task.paused:
-            return "paused (timer state unavailable)", "paused (timer state unavailable)"
-        return "unavailable", "unavailable"
+            return SchedulingState(
+                "paused (timer state unavailable)", "paused (timer state unavailable)"
+            )
+        return SchedulingState("unavailable", "unavailable")
     if task.paused:
         if enabled in {"disabled", "not-found", "masked", ""} and active != "active":
-            return "paused", "paused"
+            return SchedulingState("paused", "paused")
         detail = f"paused (timer is {enabled or 'not enabled'}, {active or 'inactive'})"
-        return detail, detail
+        return SchedulingState(detail, detail)
     if enabled == "enabled":
-        return "enabled", f"enabled ({active})"
-    return "inactive", f"{enabled or 'not enabled'} ({active or 'inactive'})"
+        detail = f"enabled ({active or 'inactive'})"
+        return SchedulingState(detail, detail)
+    detail = f"{enabled or 'not enabled'} ({active or 'inactive'})"
+    return SchedulingState(detail, detail)

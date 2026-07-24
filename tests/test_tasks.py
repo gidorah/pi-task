@@ -51,6 +51,21 @@ if name == "systemd-analyze":
         print("   Iteration #3: Wed 2030-01-09 09:00:00 UTC")
     raise SystemExit(0)
 if name == "systemctl":
+    if "show-environment" in sys.argv:
+        environment = {
+            "PATH": os.environ["FAKE_MANAGER_PATH"],
+            "FAKE_COMMAND_LOG": os.environ["FAKE_COMMAND_LOG"],
+            "FAKE_MODELS": os.environ.get(
+                "FAKE_MANAGER_MODELS",
+                os.environ.get("FAKE_MODELS", "provider model context\\nacme rocket 128K"),
+            ),
+        }
+        if "--output=json" in sys.argv:
+            print(json.dumps(environment))
+        else:
+            for key, value in environment.items():
+                print(f"{key}={value}")
+        raise SystemExit(0)
     if "is-enabled" in sys.argv:
         print(os.environ.get("FAKE_UNIT_ENABLED", "enabled"))
         raise SystemExit(0)
@@ -76,6 +91,8 @@ raise SystemExit(64)
         {
             "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
             "FAKE_COMMAND_LOG": str(log_path),
+            "FAKE_MANAGER_PATH": str(bin_dir),
+            "PI_CODING_AGENT_DIR": str(tmp_path / "pi-agent"),
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
             "NO_COLOR": "1",
         }
@@ -137,6 +154,7 @@ def test_add_list_and_show_an_enabled_calendar_task(
     assert "Upcoming occurrences" in result.stdout
     assert "2030-01-07 09:00:00 UTC" in result.stdout
     assert "Created enabled task daily-review" in result.stdout
+    assert "project has no saved Pi trust decision" not in result.stdout
 
     task_file = Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/daily-review.toml"
     task_text = task_file.read_text()
@@ -184,6 +202,35 @@ def test_add_list_and_show_an_enabled_calendar_task(
     assert "enabled (active)" in shown.stdout
 
 
+def test_list_includes_timer_activity_in_current_state(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    created = run_cli(
+        "add",
+        "failed-timer",
+        "--working-directory",
+        task_env["TEST_PROJECT"],
+        "--prompt",
+        "Inspect the project.",
+        "--calendar",
+        "daily",
+        "--model",
+        "acme/rocket",
+        "--trust",
+        "deny",
+        "--yes",
+        env=task_env,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    task_env["FAKE_UNIT_ACTIVE"] = "failed"
+
+    listed = run_cli("list", env=task_env)
+
+    assert listed.returncode == 0
+    assert "enabled (failed)" in listed.stdout
+
+
 def test_add_guides_omitted_required_values_and_can_create_paused(
     task_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
@@ -206,6 +253,7 @@ def test_add_guides_omitted_required_values_and_can_create_paused(
     assert "Calendar schedule" in result.stdout
     assert "Model (provider/model)" in result.stdout
     assert "Created paused task guided-task" in result.stdout
+    assert "project has no saved Pi trust decision" in result.stdout
 
     task_file = Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/guided-task.toml"
     task_text = task_file.read_text()
@@ -280,6 +328,89 @@ def test_invalid_task_input_leaves_no_configuration_or_units(
     config_home = Path(task_env["XDG_CONFIG_HOME"])
     assert not list(config_home.glob("pi-task/tasks/*.toml"))
     assert not list(config_home.glob("systemd/user/pi-task-*"))
+
+
+def test_model_must_be_available_to_the_systemd_user_manager(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    task_env["FAKE_MANAGER_MODELS"] = "provider model context\\nother model 128K"
+
+    result = run_cli(
+        "add",
+        "manager-model",
+        "--working-directory",
+        task_env["TEST_PROJECT"],
+        "--prompt",
+        "Inspect the project.",
+        "--calendar",
+        "daily",
+        "--model",
+        "acme/rocket",
+        "--yes",
+        env=task_env,
+    )
+
+    assert result.returncode == 1
+    assert "not available to the systemd user manager" in result.stderr
+    assert not list(Path(task_env["XDG_CONFIG_HOME"]).rglob("pi-task-*"))
+
+
+def test_saved_parent_trust_decision_suppresses_inherit_warning(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    agent_dir = Path(task_env["PI_CODING_AGENT_DIR"])
+    agent_dir.mkdir()
+    project_parent = Path(task_env["TEST_PROJECT"]).parent
+    (agent_dir / "trust.json").write_text(json.dumps({str(project_parent): True}))
+
+    result = run_cli(
+        "add",
+        "trusted-project",
+        "--working-directory",
+        task_env["TEST_PROJECT"],
+        "--prompt",
+        "Inspect the project.",
+        "--calendar",
+        "daily",
+        "--model",
+        "acme/rocket",
+        "--paused",
+        "--yes",
+        env=task_env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "project has no saved Pi trust decision" not in result.stdout
+
+
+def test_working_directory_with_control_characters_is_rejected(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+    tmp_path: Path,
+) -> None:
+    unsafe_directory = tmp_path / "unsafe\ndirectory"
+    unsafe_directory.mkdir()
+
+    result = run_cli(
+        "add",
+        "unsafe-path",
+        "--working-directory",
+        str(unsafe_directory),
+        "--prompt",
+        "Inspect the project.",
+        "--calendar",
+        "daily",
+        "--model",
+        "acme/rocket",
+        "--yes",
+        env=task_env,
+    )
+
+    assert result.returncode == 1
+    assert "working directory contains control characters" in result.stderr
+    assert not list(Path(task_env["XDG_CONFIG_HOME"]).rglob("pi-task-*"))
 
 
 def test_show_includes_the_inline_prompt(

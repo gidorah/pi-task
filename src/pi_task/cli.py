@@ -9,13 +9,12 @@ from rich.table import Table
 
 from pi_task.doctor import run_doctor
 from pi_task.tasks import (
-    THINKING_LEVELS,
-    TRUST_POLICIES,
     Task,
     TaskError,
     all_tasks,
     create_task,
     get_task,
+    has_saved_project_trust,
     parse_timeout,
     scheduling_state,
     validate_task,
@@ -104,10 +103,6 @@ def add(
         else:
             prompt_kind = "inline"
             prompt_value = prompt or ""
-        if thinking not in THINKING_LEVELS:
-            raise TaskError(f"thinking must be one of: {', '.join(THINKING_LEVELS)}")
-        if trust not in TRUST_POLICIES:
-            raise TaskError(f"trust must be one of: {', '.join(TRUST_POLICIES)}")
         task = Task(
             task_id=resolved_id,
             name=name,
@@ -122,6 +117,11 @@ def add(
             paused=paused,
         )
         preview = validate_task(task)
+        if task.trust == "inherit" and not has_saved_project_trust(task.working_directory):
+            typer.echo(
+                "Warning: project has no saved Pi trust decision; "
+                "the non-interactive trust default will apply."
+            )
         typer.echo("Upcoming occurrences:")
         for occurrence in preview.occurrences:
             typer.echo(f"  {occurrence}")
@@ -151,8 +151,8 @@ def list_tasks() -> None:
     table.add_column("Schedule")
     table.add_column("State")
     for task in tasks:
-        state, _ = scheduling_state(task)
-        table.add_row(task.task_id, task.name or "", task.calendar, state)
+        state = scheduling_state(task)
+        table.add_row(task.task_id, task.name or "", task.calendar, state.summary)
     Console().print(table)
 
 
@@ -161,7 +161,7 @@ def show(task_id: str = typer.Argument(..., help="Task ID to inspect.")) -> None
     """Show one task's configuration and current scheduling state."""
     try:
         task = get_task(task_id)
-        _, state_detail = scheduling_state(task)
+        state = scheduling_state(task)
     except TaskError as error:
         _task_error(error)
     rows = (
@@ -174,7 +174,7 @@ def show(task_id: str = typer.Argument(..., help="Task ID to inspect.")) -> None
         ("Thinking", task.thinking),
         ("Timeout", f"{task.timeout_seconds} seconds"),
         ("Trust", task.trust),
-        ("State", state_detail),
+        ("State", state.detail),
     )
     for label, value in rows:
         typer.echo(f"{label}: {value}")
@@ -182,6 +182,6 @@ def show(task_id: str = typer.Argument(..., help="Task ID to inspect.")) -> None
 
 @app.command("_run-scheduled", hidden=True)
 def run_scheduled(task_id: str) -> None:
-    """Scheduled execution boundary implemented by the run-history slice."""
-    typer.echo(f"Scheduled execution is not implemented for {task_id}.", err=True)
+    """Scheduled run boundary implemented by the run-history slice."""
+    typer.echo(f"Scheduled runs are not implemented for {task_id}.", err=True)
     raise typer.Exit(code=1)
