@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Environment diagnostics are available; task scheduling is not yet implemented.
+> **Status:** Early development. Calendar task creation and inspection are available; running tasks is not yet implemented.
 
 ## Goals
 
@@ -10,7 +10,7 @@ Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 - Per-task model and thinking-level selection
 - Persistent, resumable Pi sessions
 - Pause, resume, and independent manual runs
-- Local execution through systemd user services
+- Local runs through systemd user services
 - Task and run management through a friendly CLI
 
 ## Platform
@@ -28,7 +28,27 @@ pi-task doctor
 
 `doctor` reports required failures with a nonzero exit status. Disabled user lingering is an actionable warning because scheduled tasks can still run while the user is logged in.
 
-For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
+## Create a calendar task
+
+Run `pi-task add` without arguments for guided creation, or provide all values for scripted use:
+
+```console
+pi-task add daily-review \
+  --name "Daily review" \
+  --working-directory ~/src/project \
+  --prompt-file ~/prompts/review.md \
+  --calendar "Mon..Fri 09:00" \
+  --model openai-codex/gpt-5.4 \
+  --thinking high \
+  --timeout 30m \
+  --trust inherit
+```
+
+The command validates model availability in the systemd user-manager environment and validates the calendar expression, previews three occurrences, and asks for confirmation before writing the task definition and activating its user timer. Use exactly one of `--prompt` or `--prompt-file`, `--yes` for non-interactive confirmation, or `--paused` to create configuration and generated units without scheduling it. Inherited project trust emits a warning when Pi has no saved decision for the working directory or one of its parents.
+
+Inspect tasks with `pi-task list` and `pi-task show TASK_ID`. Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
+
+For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
 
 ## Development
 
