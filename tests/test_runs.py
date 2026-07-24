@@ -508,8 +508,14 @@ def _wait_for_running_run(env: dict[str, str], *, timeout: float = 10.0) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if db_path.is_file():
-            with sqlite3.connect(db_path) as connection:
-                row = connection.execute("SELECT id FROM runs WHERE status = 'running'").fetchone()
+            try:
+                with sqlite3.connect(db_path) as connection:
+                    row = connection.execute(
+                        "SELECT id FROM runs WHERE status = 'running'"
+                    ).fetchone()
+            except sqlite3.OperationalError:
+                # Wrapper may create the file before migrations finish.
+                row = None
             if row is not None:
                 pi_commands = [
                     command
