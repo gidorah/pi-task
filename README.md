@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Scheduled runs into resumable Pi sessions are available; manual runs and overlap protection are not yet implemented.
+> **Status:** Early development. Scheduled and manual runs into resumable Pi sessions are available; overlap protection is not yet implemented.
 
 ## Goals
 
@@ -65,16 +65,20 @@ pi-task remove daily-review --yes
 When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, hashes the resolved prompt, invokes Pi once in `--mode json` with the task model, thinking level, trust policy, working directory, timeout, and a useful session name, then records the run and ordinary Pi session path in SQLite under `$XDG_STATE_HOME/pi-task/runs.db`. Concise lifecycle lines go to the journal; the full JSON event stream does not.
 
 ```console
+pi-task run daily-review
+pi-task run daily-review --detach
 pi-task runs
 pi-task runs daily-review
 pi-task resume-session RUN_ID
 ```
 
+`run` starts a uniquely named transient systemd user service (`--collect`) that invokes the same wrapper as a scheduled activation with source `manual`. Waiting for completion is the default and prints the final run status; `--detach` returns after successful submission. Manual runs never enable, disable, restart, or otherwise modify the recurring timer.
+
 `runs` lists recorded status, duration, model, and session identifiers. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage.
 
 Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
 
-For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
+For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, `PI_TASK_SYSTEMD_RUN_EXECUTABLE`, `PI_TASK_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
 
 ## Development
 

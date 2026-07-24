@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from pi_task.db import get_run, list_runs, open_db
+from pi_task.db import RunRecord, get_run, list_runs, open_db
 from pi_task.doctor import run_doctor
 from pi_task.runner import execute_task_run, resolve_pi
 from pi_task.tasks import (
@@ -25,6 +25,7 @@ from pi_task.tasks import (
     remove_task,
     resume_task,
     scheduling_state,
+    start_manual_run,
     sync_tasks,
     update_task,
     validate_task,
@@ -69,6 +70,34 @@ def _required(value: str | None, label: str) -> str:
 def _task_error(error: TaskError) -> NoReturn:
     typer.echo(f"Error: {error}", err=True)
     raise typer.Exit(code=1)
+
+
+def _echo_run_summary(record: RunRecord, *, verbose: bool = False) -> None:
+    """Print a compact run summary shared by `run` and `runs`."""
+    duration = f"{record.duration_ms / 1000:.1f}s" if record.duration_ms is not None else "unknown"
+    typer.echo(f"Run: {record.id}")
+    typer.echo(f"Task: {record.task_id}")
+    typer.echo(f"Source: {record.source}")
+    typer.echo(f"Status: {record.status}")
+    typer.echo(f"Duration: {duration}")
+    if verbose:
+        if record.input_tokens is None and record.output_tokens is None:
+            tokens = "unavailable"
+        else:
+            tokens = f"in={record.input_tokens or 0} out={record.output_tokens or 0}"
+        cost = "unavailable" if record.cost_total is None else str(record.cost_total)
+        typer.echo(f"Model: {record.model}")
+        typer.echo(f"Tokens: {tokens}")
+        typer.echo(f"Cost: {cost}")
+        typer.echo(f"Session: {record.session_id or ''}")
+        typer.echo(f"Session path: {record.session_path or ''}")
+    else:
+        if record.session_id:
+            typer.echo(f"Session: {record.session_id}")
+        if record.session_path:
+            typer.echo(f"Session path: {record.session_path}")
+        if record.error:
+            typer.echo(f"Error: {record.error}")
 
 
 def _resolve_prompt(
@@ -394,20 +423,65 @@ def sync() -> None:
     )
 
 
+@app.command("run")
+def run_task(
+    task_id: str = typer.Argument(..., help="Task ID to run immediately."),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help="Return after submitting the transient service without waiting.",
+    ),
+) -> None:
+    """Run a task once via a transient systemd user service without touching its timer."""
+    try:
+        submission = start_manual_run(task_id, detach=detach)
+    except TaskError as error:
+        _task_error(error)
+        raise
+    if detach:
+        typer.echo(
+            f"Submitted manual run {submission.run_id} for task {task_id} (unit {submission.unit})."
+        )
+        raise typer.Exit()
+    try:
+        with open_db() as connection:
+            record = get_run(connection, submission.run_id)
+    except TaskError as error:
+        _task_error(error)
+        raise
+    if record is None:
+        detail = submission.service_detail or (
+            f"manual run {submission.run_id} produced no history "
+            f"(service exit {submission.service_exit_code})"
+        )
+        typer.echo(f"Error: {detail}", err=True)
+        raise typer.Exit(code=1)
+    _echo_run_summary(record)
+    raise typer.Exit(code=0 if record.status == "succeeded" else 1)
+
+
 @app.command("_run-scheduled", hidden=True)
 def run_scheduled(
     task_id: str = typer.Argument(..., help="Task ID to run."),
     source: str = typer.Option(
         "scheduled",
         "--source",
-        help="Run source recorded in history. Scheduled services pass scheduled.",
+        help="Run source recorded in history: scheduled or manual.",
+    ),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help="Optional run identifier; generated when omitted.",
     ),
 ) -> None:
-    """Run one scheduled task through the thin Pi wrapper."""
+    """Run one task through the thin Pi wrapper (scheduled or manual entrypoint)."""
     try:
-        if source != "scheduled":
-            raise TaskError("scheduled service entrypoint requires --source scheduled")
-        code = execute_task_run(task_id, source="scheduled")
+        if source == "scheduled":
+            code = execute_task_run(task_id, source="scheduled", run_id=run_id)
+        elif source == "manual":
+            code = execute_task_run(task_id, source="manual", run_id=run_id)
+        else:
+            raise TaskError("run source must be scheduled or manual")
     except TaskError as error:
         _task_error(error)
         raise
@@ -434,24 +508,7 @@ def runs(
     for index, record in enumerate(records):
         if index:
             typer.echo("")
-        duration = (
-            f"{record.duration_ms / 1000:.1f}s" if record.duration_ms is not None else "unknown"
-        )
-        if record.input_tokens is None and record.output_tokens is None:
-            tokens = "unavailable"
-        else:
-            tokens = f"in={record.input_tokens or 0} out={record.output_tokens or 0}"
-        cost = "unavailable" if record.cost_total is None else str(record.cost_total)
-        typer.echo(f"Run: {record.id}")
-        typer.echo(f"Task: {record.task_id}")
-        typer.echo(f"Source: {record.source}")
-        typer.echo(f"Status: {record.status}")
-        typer.echo(f"Duration: {duration}")
-        typer.echo(f"Model: {record.model}")
-        typer.echo(f"Tokens: {tokens}")
-        typer.echo(f"Cost: {cost}")
-        typer.echo(f"Session: {record.session_id or ''}")
-        typer.echo(f"Session path: {record.session_path or ''}")
+        _echo_run_summary(record, verbose=True)
 
 
 @app.command("resume-session")

@@ -185,11 +185,16 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def execute_task_run(task_id: str, *, source: RunSource) -> int:
+def execute_task_run(
+    task_id: str,
+    *,
+    source: RunSource,
+    run_id: str | None = None,
+) -> int:
     task = get_task(task_id)
     snapshot = TaskSnapshot.from_task(task)
     prompt_text, prompt_hash = resolve_prompt_text(task)
-    run_id = str(uuid.uuid4())
+    run_id = run_id or str(uuid.uuid4())
     session_name = f"pi-task:{task.task_id}:{run_id[:8]}"
     started = _now()
     snapshot_json = json.dumps(asdict(snapshot), ensure_ascii=True, sort_keys=True)

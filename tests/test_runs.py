@@ -128,11 +128,27 @@ if name == "systemctl":
         print("active")
         raise SystemExit(0)
     raise SystemExit(0)
+if name == "systemd-run":
+    import subprocess
+
+    args = sys.argv[1:]
+    wait = "--wait" in args
+    command: list[str] = []
+    for index, arg in enumerate(args):
+        if arg == "--":
+            command = args[index + 1 :]
+            break
+        if not arg.startswith("-"):
+            command = args[index:]
+            break
+    if wait and command:
+        raise SystemExit(subprocess.call(command))
+    raise SystemExit(0)
 raise SystemExit(64)
 """
     )
     fake.chmod(0o755)
-    for name in ("pi", "systemctl", "systemd-analyze"):
+    for name in ("pi", "systemctl", "systemd-analyze", "systemd-run"):
         (bin_dir / name).symlink_to(fake)
     (bin_dir / "python3").symlink_to(sys.executable)
 
@@ -157,6 +173,8 @@ raise SystemExit(64)
         "PI_TASK_PI_EXECUTABLE",
         "PI_TASK_SYSTEMCTL_EXECUTABLE",
         "PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE",
+        "PI_TASK_SYSTEMD_RUN_EXECUTABLE",
+        "PI_TASK_EXECUTABLE",
     ):
         env.pop(variable, None)
     return env
@@ -336,14 +354,110 @@ def test_service_unit_invokes_wrapper_with_task_identity(
     assert "_run-scheduled wired --source scheduled" in service
 
 
-def test_scheduled_entrypoint_rejects_non_scheduled_source(
+def test_scheduled_entrypoint_rejects_unknown_source(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
     _add_task(run_cli, run_env, "source-check")
-    result = run_cli("_run-scheduled", "source-check", "--source", "manual", env=run_env)
+    result = run_cli("_run-scheduled", "source-check", "--source", "mystery", env=run_env)
     assert result.returncode != 0
-    assert "requires --source scheduled" in result.stderr
+    assert "source" in result.stderr.lower()
+
+
+def test_run_waits_records_manual_source_and_reports_status(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "manual-wait")
+    _clear_commands(run_env)
+
+    executed = run_cli("run", "manual-wait", env=run_env)
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    assert "succeeded" in executed.stdout
+    assert "manual-wait" in executed.stdout
+
+    commands = _commands(run_env)
+    systemd_run = [command for command in commands if command[0] == "systemd-run"]
+    assert len(systemd_run) == 1
+    invocation = systemd_run[0]
+    assert "--user" in invocation
+    assert "--collect" in invocation
+    assert "--wait" in invocation
+    unit_args = [arg for arg in invocation if arg.startswith("--unit=")]
+    assert len(unit_args) == 1
+    assert unit_args[0].startswith("--unit=pi-task-run-manual-wait-")
+    # Full UUID hex suffix (32 chars) keeps unit names unique without hyphens.
+    assert len(unit_args[0].removeprefix("--unit=pi-task-run-manual-wait-")) == 32
+    assert "_run-scheduled" in invocation
+    assert "manual-wait" in invocation
+    source_index = invocation.index("--source")
+    assert invocation[source_index + 1] == "manual"
+
+    systemctl = [command for command in commands if command[0] == "systemctl"]
+    timer_mutations = [
+        command
+        for command in systemctl
+        if any(verb in command for verb in ("enable", "disable", "restart", "start", "stop"))
+        and any(arg.endswith(".timer") for arg in command)
+    ]
+    assert timer_mutations == []
+
+    listed = run_cli("runs", "manual-wait", env=run_env)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "manual" in listed.stdout
+    assert "succeeded" in listed.stdout
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        source, status, session_path = connection.execute(
+            "SELECT source, status, session_path FROM runs"
+        ).fetchone()
+    assert source == "manual"
+    assert status == "succeeded"
+    assert session_path is not None and Path(session_path).is_file()
+
+    unit_dir = Path(run_env["XDG_CONFIG_HOME"]) / "systemd" / "user"
+    transient_units = list(unit_dir.glob("pi-task-run-*"))
+    assert transient_units == []
+
+
+def test_run_detach_submits_without_waiting(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "manual-detach")
+    _clear_commands(run_env)
+
+    executed = run_cli("run", "manual-detach", "--detach", env=run_env)
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    assert "submitted" in executed.stdout.lower() or "started" in executed.stdout.lower()
+
+    commands = _commands(run_env)
+    systemd_run = [command for command in commands if command[0] == "systemd-run"]
+    assert len(systemd_run) == 1
+    invocation = systemd_run[0]
+    assert "--wait" not in invocation
+    assert "--collect" in invocation
+    assert "--user" in invocation
+    source_index = invocation.index("--source")
+    assert invocation[source_index + 1] == "manual"
+
+    # Detached submission does not run the wrapper in the fake manager, so no DB row yet.
+    listed = run_cli("runs", "manual-detach", env=run_env)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "No runs recorded" in listed.stdout or "manual" not in listed.stdout
+
+
+def test_run_unknown_task_fails_without_starting_service(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _clear_commands(run_env)
+    result = run_cli("run", "missing-task", env=run_env)
+    assert result.returncode != 0
+    assert "does not exist" in result.stderr
+    commands = _commands(run_env)
+    assert [command for command in commands if command[0] == "systemd-run"] == []
 
 
 def test_sigterm_marks_run_cancelled(
