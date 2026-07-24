@@ -25,6 +25,7 @@ from pi_task.db import (
     open_db,
 )
 from pi_task.events import StreamObservation, classify_run_status, consume_event_line
+from pi_task.locks import LockConflict, acquire_run_locks
 from pi_task.tasks import Task, TaskError, get_task
 
 
@@ -199,6 +200,47 @@ def execute_task_run(
     started = _now()
     snapshot_json = json.dumps(asdict(snapshot), ensure_ascii=True, sort_keys=True)
 
+    try:
+        with acquire_run_locks(task.task_id, task.working_directory):
+            return _execute_locked_run(
+                task=task,
+                snapshot=snapshot,
+                prompt_text=prompt_text,
+                prompt_hash=prompt_hash,
+                snapshot_json=snapshot_json,
+                source=source,
+                run_id=run_id,
+                session_name=session_name,
+                started=started,
+            )
+    except LockConflict as conflict:
+        return _record_lock_conflict(
+            run_id=run_id,
+            task=task,
+            source=source,
+            started=started,
+            snapshot=snapshot,
+            prompt_hash=prompt_hash,
+            snapshot_json=snapshot_json,
+            session_name=session_name,
+            conflict=conflict,
+        )
+    except (OSError, RuntimeError) as error:
+        raise TaskError(f"could not acquire run locks: {error}") from error
+
+
+def _execute_locked_run(
+    *,
+    task: Task,
+    snapshot: TaskSnapshot,
+    prompt_text: str,
+    prompt_hash: str,
+    snapshot_json: str,
+    source: RunSource,
+    run_id: str,
+    session_name: str,
+    started: datetime,
+) -> int:
     with open_db() as connection:
         insert_run(
             connection,
@@ -356,6 +398,69 @@ def execute_task_run(
     finally:
         for signum, handler in previous_handlers:
             signal.signal(signum, handler)
+
+
+def _record_lock_conflict(
+    *,
+    run_id: str,
+    task: Task,
+    source: RunSource,
+    started: datetime,
+    snapshot: TaskSnapshot,
+    prompt_hash: str,
+    snapshot_json: str,
+    session_name: str,
+    conflict: LockConflict,
+) -> int:
+    """Record a lock conflict without starting Pi.
+
+    Scheduled conflicts are skipped (exit 0). Manual conflicts fail clearly (exit 1).
+    """
+    if source == "scheduled":
+        status: RunStatus = "skipped"
+        error = f"skipped: {conflict.message}"
+        exit_code = 0
+    else:
+        status = "failed"
+        error = conflict.message
+        exit_code = 1
+
+    _log(f"run {run_id}: {error}")
+    with open_db() as connection:
+        insert_run(
+            connection,
+            NewRun(
+                id=run_id,
+                task_id=task.task_id,
+                source=source,
+                started_at=_iso(started),
+                session_name=session_name,
+                prompt_hash=prompt_hash,
+                snapshot_json=snapshot_json,
+                model=snapshot.model,
+                thinking=snapshot.thinking,
+            ),
+        )
+        finished = _now()
+        duration_ms = max(0, int((finished - started).total_seconds() * 1000))
+        finish_run(
+            connection,
+            run_id,
+            RunCompletion(
+                status=status,
+                finished_at=_iso(finished),
+                duration_ms=duration_ms,
+                session_id=None,
+                session_path=None,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_write_tokens=None,
+                cost_total=None,
+                error=error,
+            ),
+        )
+    return exit_code
 
 
 def _finalize(

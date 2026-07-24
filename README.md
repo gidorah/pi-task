@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Scheduled and manual runs into resumable Pi sessions are available; overlap protection is not yet implemented.
+> **Status:** Early development. Scheduled and manual runs into resumable Pi sessions are available with overlap protection.
 
 ## Goals
 
@@ -62,7 +62,7 @@ pi-task remove daily-review --yes
 
 `edit` validates the full resulting configuration and applies it atomically. Editing or resuming an interval restarts the interval from that moment. `pause` suppresses future scheduled runs without cancelling an active run and clears calendar persistence so paused occurrences are skipped. `resume` schedules only future occurrences. `sync` regenerates units from task definitions and removes generated orphan units. `remove` stops future scheduling and deletes the definition and generated units without touching run or session history.
 
-When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, hashes the resolved prompt, invokes Pi once in `--mode json` with the task model, thinking level, trust policy, working directory, timeout, and a useful session name, then records the run and ordinary Pi session path in SQLite under `$XDG_STATE_HOME/pi-task/runs.db`. Concise lifecycle lines go to the journal; the full JSON event stream does not.
+When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, takes exclusive same-task and same-working-directory locks under `$XDG_RUNTIME_DIR/pi-task/locks`, hashes the resolved prompt, invokes Pi once in `--mode json` with the task model, thinking level, trust policy, working directory, timeout, and a useful session name, then records the run and ordinary Pi session path in SQLite under `$XDG_STATE_HOME/pi-task/runs.db`. A scheduled lock conflict is recorded as skipped without starting Pi; a blocked manual run fails clearly. Tasks in different working directories may run concurrently. Concise lifecycle lines go to the journal; the full JSON event stream does not. An active run's session cannot be opened interactively until the run finishes.
 
 ```console
 pi-task run daily-review

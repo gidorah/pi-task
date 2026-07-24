@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 RunSource = Literal["scheduled", "manual"]
-RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled"]
+RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled", "skipped"]
 
 _SCHEMA_VERSION = 1
 
@@ -111,6 +111,8 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
+    # WAL allows concurrent readers/writers when different tasks run together.
+    connection.execute("PRAGMA journal_mode = WAL")
     return connection
 
 
