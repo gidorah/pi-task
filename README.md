@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Scheduled and manual runs into resumable Pi sessions are available with overlap protection.
+> **Status:** Early development. Scheduled and manual runs into resumable Pi sessions are available with overlap protection, timeouts, and cancellation.
 
 ## Goals
 
@@ -67,6 +67,7 @@ When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID -
 ```console
 pi-task run daily-review
 pi-task run daily-review --detach
+pi-task cancel RUN_ID
 pi-task runs
 pi-task runs daily-review
 pi-task resume-session RUN_ID
@@ -74,7 +75,11 @@ pi-task resume-session RUN_ID
 
 `run` starts a uniquely named transient systemd user service (`--collect`) that invokes the same wrapper as a scheduled activation with source `manual`. Waiting for completion is the default and prints the final run status; `--detach` returns after successful submission. Manual runs never enable, disable, restart, or otherwise modify the recurring timer.
 
-`runs` lists recorded status, duration, model, and session identifiers. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage.
+`cancel` stops a recorded active scheduled or manual run by stopping its systemd user unit. The wrapper forwards termination to Pi with a short grace period, records status `cancelled` (distinct from `timed_out` and `failed`), and keeps any partial Pi session for later inspection or `resume-session`. Pausing a task only suppresses future schedule activations and does not cancel work already running.
+
+The wrapper enforces each task's timeout (default 30 minutes) and records `timed_out` runs. Generated services and manual transient units also set `RuntimeMaxSec` slightly above the task timeout so systemd can kill a hung wrapper as a backstop, and `TimeoutStopSec` so unit stop during cancel stays bounded. After upgrading, run `pi-task sync` so existing scheduled units pick up these service properties. Failed, cancelled, and timed-out runs retain discovered session paths when Pi wrote a session before exiting. pi-task does not automatically replay failed prompts.
+
+`runs` lists recorded status, duration, model, and session identifiers. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage. Sessions from failed, cancelled, and timed-out runs remain available once the run is no longer active.
 
 Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
 
