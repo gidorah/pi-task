@@ -94,6 +94,7 @@ raise SystemExit(64)
             "FAKE_MANAGER_PATH": str(bin_dir),
             "PI_CODING_AGENT_DIR": str(tmp_path / "pi-agent"),
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_DATA_HOME": str(tmp_path / "data"),
             "NO_COLOR": "1",
         }
     )
@@ -106,6 +107,37 @@ raise SystemExit(64)
     env["TEST_PROJECT"] = str(project)
     env["TEST_PROMPT_FILE"] = str(prompt_file)
     return env
+
+
+def _commands(env: dict[str, str]) -> list[list[str]]:
+    return [json.loads(line) for line in Path(env["FAKE_COMMAND_LOG"]).read_text().splitlines()]
+
+
+def _clear_commands(env: dict[str, str]) -> None:
+    Path(env["FAKE_COMMAND_LOG"]).write_text("")
+
+
+def _add_task(
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+    env: dict[str, str],
+    task_id: str,
+    *extra: str,
+) -> subprocess.CompletedProcess[str]:
+    return run_cli(
+        "add",
+        task_id,
+        "--working-directory",
+        env["TEST_PROJECT"],
+        "--prompt",
+        "Inspect the project.",
+        "--model",
+        "acme/rocket",
+        "--trust",
+        "deny",
+        "--yes",
+        *extra,
+        env=env,
+    )
 
 
 @pytest.fixture
@@ -495,3 +527,343 @@ def test_activation_failure_rolls_back_task_and_generated_units(
     config_home = Path(task_env["XDG_CONFIG_HOME"])
     assert not list(config_home.glob("pi-task/tasks/*.toml"))
     assert not list(config_home.glob("systemd/user/pi-task-*"))
+
+
+def test_add_interval_task_fires_after_one_interval(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    result = _add_task(run_cli, task_env, "heartbeat", "--interval", "15m")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Created enabled task heartbeat" in result.stdout
+    assert "every 15m" in result.stdout
+
+    task_text = (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/heartbeat.toml").read_text()
+    assert 'kind = "interval"' in task_text
+    assert 'every = "15m"' in task_text
+    assert "catch_up" not in task_text
+
+    timer = (Path(task_env["XDG_CONFIG_HOME"]) / "systemd/user/pi-task-heartbeat.timer").read_text()
+    assert "OnActiveSec=15m" in timer
+    assert "OnUnitActiveSec=15m" in timer
+    assert "OnCalendar=" not in timer
+    assert "Persistent=" not in timer
+
+    listed = run_cli("list", env=task_env)
+    assert listed.returncode == 0
+    assert "every 15m" in listed.stdout
+
+    shown = run_cli("show", "heartbeat", env=task_env)
+    assert shown.returncode == 0
+    assert "Schedule: every 15m" in shown.stdout
+
+
+def test_interval_faster_than_one_minute_is_rejected(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    result = _add_task(run_cli, task_env, "too-fast", "--interval", "30s")
+
+    assert result.returncode == 1
+    assert "at least one minute" in result.stderr
+    assert not list(Path(task_env["XDG_CONFIG_HOME"]).glob("pi-task/tasks/*.toml"))
+
+
+def test_calendar_catch_up_is_configurable(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    enabled = _add_task(run_cli, task_env, "catch-up", "--calendar", "daily", "--catch-up")
+    assert enabled.returncode == 0, enabled.stdout + enabled.stderr
+    timer = (Path(task_env["XDG_CONFIG_HOME"]) / "systemd/user/pi-task-catch-up.timer").read_text()
+    assert "Persistent=true" in timer
+    task_text = (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/catch-up.toml").read_text()
+    assert "catch_up = true" in task_text
+
+    disabled = _add_task(run_cli, task_env, "no-catch-up", "--calendar", "daily", "--no-catch-up")
+    assert disabled.returncode == 0, disabled.stdout + disabled.stderr
+    timer = (
+        Path(task_env["XDG_CONFIG_HOME"]) / "systemd/user/pi-task-no-catch-up.timer"
+    ).read_text()
+    assert "Persistent=true" not in timer
+    assert "Persistent=false" in timer or "Persistent=" not in timer
+
+
+def test_pause_suppresses_future_runs_and_clears_calendar_persistence(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    created = _add_task(run_cli, task_env, "pausable", "--calendar", "daily")
+    assert created.returncode == 0, created.stdout + created.stderr
+
+    stamp = Path(task_env["XDG_DATA_HOME"]) / "systemd/timers/stamp-pi-task-pausable.timer"
+    stamp.parent.mkdir(parents=True)
+    stamp.write_text("stale")
+    _clear_commands(task_env)
+
+    paused = run_cli("pause", "pausable", env=task_env)
+
+    assert paused.returncode == 0, paused.stdout + paused.stderr
+    assert "Paused task pausable" in paused.stdout
+    assert (
+        "paused = true"
+        in (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/pausable.toml").read_text()
+    )
+    assert not stamp.exists()
+    commands = _commands(task_env)
+    assert ["systemctl", "--user", "disable", "--now", "pi-task-pausable.timer"] in commands
+    assert not any(
+        command[:3] == ["systemctl", "--user", "stop"] and command[-1].endswith(".service")
+        for command in commands
+    )
+
+    task_env["FAKE_UNIT_ENABLED"] = "disabled"
+    task_env["FAKE_UNIT_ACTIVE"] = "inactive"
+    shown = run_cli("show", "pausable", env=task_env)
+    assert "State: paused" in shown.stdout
+
+    stamp.write_text("stale-again")
+    task_env["FAKE_UNIT_ENABLED"] = "enabled"
+    task_env["FAKE_UNIT_ACTIVE"] = "active"
+    _clear_commands(task_env)
+    healed = run_cli("pause", "pausable", env=task_env)
+    assert healed.returncode == 0, healed.stdout + healed.stderr
+    assert not stamp.exists()
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-pausable.timer",
+    ] in _commands(task_env)
+
+
+def test_resume_schedules_only_future_occurrences_and_restarts_intervals(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    calendar = _add_task(run_cli, task_env, "resume-cal", "--calendar", "daily", "--paused")
+    interval = _add_task(run_cli, task_env, "resume-int", "--interval", "1h", "--paused")
+    assert calendar.returncode == 0, calendar.stdout + calendar.stderr
+    assert interval.returncode == 0, interval.stdout + interval.stderr
+    _clear_commands(task_env)
+
+    resumed_calendar = run_cli("resume", "resume-cal", env=task_env)
+    resumed_interval = run_cli("resume", "resume-int", env=task_env)
+
+    assert resumed_calendar.returncode == 0, resumed_calendar.stdout + resumed_calendar.stderr
+    assert resumed_interval.returncode == 0, resumed_interval.stdout + resumed_interval.stderr
+    assert (
+        "paused = false"
+        in (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/resume-cal.toml").read_text()
+    )
+    assert (
+        "paused = false"
+        in (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/resume-int.toml").read_text()
+    )
+    commands = _commands(task_env)
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-resume-cal.timer",
+    ] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-resume-int.timer",
+    ] in commands
+
+    _clear_commands(task_env)
+    task_env["FAKE_UNIT_ENABLED"] = "disabled"
+    healed = run_cli("resume", "resume-cal", env=task_env)
+    assert healed.returncode == 0, healed.stdout + healed.stderr
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-resume-cal.timer",
+    ] in _commands(task_env)
+
+
+def test_interval_rejects_explicit_catch_up(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    result = _add_task(run_cli, task_env, "bad-catch-up", "--interval", "15m", "--catch-up")
+
+    assert result.returncode == 1
+    assert "do not support calendar catch-up" in result.stderr
+    assert not list(Path(task_env["XDG_CONFIG_HOME"]).glob("pi-task/tasks/*.toml"))
+
+
+def test_edit_validates_atomically_and_restarts_interval_schedules(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    created = _add_task(run_cli, task_env, "editable", "--interval", "1h")
+    assert created.returncode == 0, created.stdout + created.stderr
+    original = (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/editable.toml").read_text()
+
+    invalid = run_cli(
+        "edit",
+        "editable",
+        "--model",
+        "missing/model",
+        env=task_env,
+    )
+    assert invalid.returncode == 1
+    assert "not available" in invalid.stderr
+    assert (
+        Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/editable.toml"
+    ).read_text() == original
+
+    _clear_commands(task_env)
+    valid = run_cli(
+        "edit",
+        "editable",
+        "--name",
+        "Editable task",
+        "--interval",
+        "2h",
+        "--thinking",
+        "low",
+        env=task_env,
+    )
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    assert "Updated task editable" in valid.stdout
+
+    task_text = (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/editable.toml").read_text()
+    assert 'name = "Editable task"' in task_text
+    assert 'every = "2h"' in task_text
+    assert 'thinking = "low"' in task_text
+    timer = (Path(task_env["XDG_CONFIG_HOME"]) / "systemd/user/pi-task-editable.timer").read_text()
+    assert "OnActiveSec=2h" in timer
+    assert "OnUnitActiveSec=2h" in timer
+
+    commands = _commands(task_env)
+    assert ["systemctl", "--user", "daemon-reload"] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-editable.timer",
+    ] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-editable.timer",
+    ] in commands
+
+
+def test_edit_preserves_calendar_timer_when_schedule_is_unchanged(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    created = _add_task(run_cli, task_env, "stable-cal", "--calendar", "daily")
+    assert created.returncode == 0, created.stdout + created.stderr
+    stamp = Path(task_env["XDG_DATA_HOME"]) / "systemd/timers/stamp-pi-task-stable-cal.timer"
+    stamp.parent.mkdir(parents=True)
+    stamp.write_text("catch-up")
+    _clear_commands(task_env)
+
+    edited = run_cli("edit", "stable-cal", "--thinking", "high", env=task_env)
+
+    assert edited.returncode == 0, edited.stdout + edited.stderr
+    assert stamp.read_text() == "catch-up"
+    commands = _commands(task_env)
+    assert ["systemctl", "--user", "daemon-reload"] in commands
+    assert not any("disable" in command for command in commands)
+    assert not any(
+        command[:4] == ["systemctl", "--user", "enable", "--now"] for command in commands
+    )
+
+
+def test_remove_stops_scheduling_and_keeps_definition_history_out_of_scope(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    created = _add_task(run_cli, task_env, "removable", "--calendar", "daily")
+    assert created.returncode == 0, created.stdout + created.stderr
+    _clear_commands(task_env)
+
+    removed = run_cli("remove", "removable", "--yes", env=task_env)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert "Removed task removable" in removed.stdout
+    config_home = Path(task_env["XDG_CONFIG_HOME"])
+    assert not (config_home / "pi-task/tasks/removable.toml").exists()
+    assert not (config_home / "systemd/user/pi-task-removable.service").exists()
+    assert not (config_home / "systemd/user/pi-task-removable.timer").exists()
+    commands = _commands(task_env)
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-removable.timer",
+    ] in commands
+    assert not any(command[-1].endswith(".service") and "stop" in command for command in commands)
+
+
+def test_sync_reconciles_units_and_removes_generated_orphans(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    created = _add_task(run_cli, task_env, "syncable", "--calendar", "daily")
+    assert created.returncode == 0, created.stdout + created.stderr
+
+    unit_dir = Path(task_env["XDG_CONFIG_HOME"]) / "systemd/user"
+    timer_path = unit_dir / "pi-task-syncable.timer"
+    timer_path.write_text(timer_path.read_text().replace("OnCalendar=daily", "OnCalendar=hourly"))
+
+    orphan_service = unit_dir / "pi-task-orphan.service"
+    orphan_timer = unit_dir / "pi-task-orphan.timer"
+    orphan_service.write_text(
+        "# Generated by pi-task. Do not edit.\n[Service]\nExecStart=/bin/true\n"
+    )
+    orphan_timer.write_text("# Generated by pi-task. Do not edit.\n[Timer]\nOnCalendar=daily\n")
+    foreign = unit_dir / "pi-task-foreign.service"
+    foreign.write_text("[Service]\nExecStart=/bin/true\n")
+    _clear_commands(task_env)
+
+    synced = run_cli("sync", env=task_env)
+
+    assert synced.returncode == 0, synced.stdout + synced.stderr
+    assert "Synchronized" in synced.stdout
+    assert "OnCalendar=daily" in timer_path.read_text()
+    assert "Persistent=true" in timer_path.read_text()
+    assert not orphan_service.exists()
+    assert not orphan_timer.exists()
+    assert foreign.exists()
+    commands = _commands(task_env)
+    assert ["systemctl", "--user", "daemon-reload"] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-orphan.timer",
+    ] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "disable",
+        "--now",
+        "pi-task-syncable.timer",
+    ] in commands
+    assert [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "pi-task-syncable.timer",
+    ] in commands
