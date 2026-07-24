@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
 RunSource = Literal["scheduled", "manual"]
-RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled"]
+RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled", "skipped"]
 
 _SCHEMA_VERSION = 1
 
@@ -111,6 +113,8 @@ def _connect(path: Path | None = None) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
+    # WAL allows concurrent readers/writers when different tasks run together.
+    connection.execute("PRAGMA journal_mode = WAL")
     return connection
 
 
@@ -170,9 +174,19 @@ def insert_run(connection: sqlite3.Connection, run: NewRun) -> None:
     )
 
 
-def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompletion) -> None:
-    connection.execute(
-        """
+def finish_run(
+    connection: sqlite3.Connection,
+    run_id: str,
+    completion: RunCompletion,
+    *,
+    only_if_running: bool = False,
+) -> bool:
+    """Apply a terminal status. Returns True if a row was updated.
+
+    When ``only_if_running`` is True, skip rows already finalized (avoids
+    overwriting a live wrapper's later completion in rare races).
+    """
+    query = """
         UPDATE runs SET
             status = ?,
             finished_at = ?,
@@ -186,7 +200,11 @@ def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompl
             cost_total = ?,
             error = ?
         WHERE id = ?
-        """,
+        """
+    if only_if_running:
+        query += " AND status = 'running'"
+    cursor = connection.execute(
+        query,
         (
             completion.status,
             completion.finished_at,
@@ -202,6 +220,7 @@ def finish_run(connection: sqlite3.Connection, run_id: str, completion: RunCompl
             run_id,
         ),
     )
+    return cursor.rowcount > 0
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
@@ -251,3 +270,84 @@ def list_runs(
 def get_run(connection: sqlite3.Connection, run_id: str) -> RunRecord | None:
     row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     return _row_to_run(row) if row is not None else None
+
+
+def list_running_runs(connection: sqlite3.Connection) -> list[RunRecord]:
+    rows = connection.execute("SELECT * FROM runs WHERE status = 'running'").fetchall()
+    return [_row_to_run(row) for row in rows]
+
+
+def _snapshot_working_directory(snapshot_json: str) -> str | None:
+    try:
+        data = json.loads(snapshot_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("working_directory")
+    return value if isinstance(value, str) else None
+
+
+def abandon_orphaned_runs(
+    connection: sqlite3.Connection,
+    *,
+    task_id: str,
+    working_directory: str,
+    finished_at: str | None = None,
+    except_run_id: str | None = None,
+) -> list[str]:
+    """Mark running rows proven dead by holding their locks as failed.
+
+    Holding the task and working-directory locks means no live wrapper owns those
+    scopes, so any still-``running`` history for the same task or normalized
+    working directory is an interrupted-wrapper orphan.
+    """
+    finished = finished_at or datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+    abandoned: list[str] = []
+    for record in list_running_runs(connection):
+        if except_run_id is not None and record.id == except_run_id:
+            continue
+        snapshot_cwd = _snapshot_working_directory(record.snapshot_json)
+        same_task = record.task_id == task_id
+        if snapshot_cwd is not None:
+            try:
+                normalized_snapshot = str(Path(snapshot_cwd).expanduser().resolve())
+            except OSError:
+                normalized_snapshot = snapshot_cwd
+        else:
+            normalized_snapshot = None
+        same_directory = (
+            normalized_snapshot is not None and normalized_snapshot == working_directory
+        )
+        if not same_task and not same_directory:
+            continue
+        started = record.started_at
+        try:
+            start_moment = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            end_moment = datetime.fromisoformat(finished.replace("Z", "+00:00"))
+            duration_ms = max(0, int((end_moment - start_moment).total_seconds() * 1000))
+        except ValueError:
+            duration_ms = 0
+        updated = finish_run(
+            connection,
+            record.id,
+            RunCompletion(
+                status="failed",
+                finished_at=finished,
+                duration_ms=duration_ms,
+                session_id=record.session_id,
+                session_path=record.session_path,
+                input_tokens=record.input_tokens,
+                output_tokens=record.output_tokens,
+                cache_read_tokens=record.cache_read_tokens,
+                cache_write_tokens=record.cache_write_tokens,
+                cost_total=record.cost_total,
+                error="wrapper interrupted; run abandoned after stale lock recovery",
+            ),
+            only_if_running=True,
+        )
+        if updated:
+            abandoned.append(record.id)
+    return abandoned

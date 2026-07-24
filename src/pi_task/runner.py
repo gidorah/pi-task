@@ -20,11 +20,14 @@ from pi_task.db import (
     RunCompletion,
     RunSource,
     RunStatus,
+    abandon_orphaned_runs,
     finish_run,
+    get_run,
     insert_run,
     open_db,
 )
 from pi_task.events import StreamObservation, classify_run_status, consume_event_line
+from pi_task.locks import LockConflict, RunLocks, acquire_run_locks, normalize_working_directory
 from pi_task.tasks import Task, TaskError, get_task
 
 
@@ -185,43 +188,138 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+@dataclass(frozen=True)
+class PreparedRun:
+    """Immutable startup context for one wrapper invocation."""
+
+    task: Task
+    snapshot: TaskSnapshot
+    prompt_text: str
+    prompt_hash: str
+    snapshot_json: str
+    source: RunSource
+    run_id: str
+    session_name: str
+    started: datetime
+
+    @classmethod
+    def build(
+        cls,
+        task_id: str,
+        *,
+        source: RunSource,
+        run_id: str | None = None,
+    ) -> PreparedRun:
+        task = get_task(task_id)
+        snapshot = TaskSnapshot.from_task(task)
+        prompt_text, prompt_hash = resolve_prompt_text(task)
+        resolved_id = run_id or str(uuid.uuid4())
+        return cls(
+            task=task,
+            snapshot=snapshot,
+            prompt_text=prompt_text,
+            prompt_hash=prompt_hash,
+            snapshot_json=json.dumps(asdict(snapshot), ensure_ascii=True, sort_keys=True),
+            source=source,
+            run_id=resolved_id,
+            session_name=f"pi-task:{task.task_id}:{resolved_id[:8]}",
+            started=_now(),
+        )
+
+    def as_new_run(self) -> NewRun:
+        return NewRun(
+            id=self.run_id,
+            task_id=self.task.task_id,
+            source=self.source,
+            started_at=_iso(self.started),
+            session_name=self.session_name,
+            prompt_hash=self.prompt_hash,
+            snapshot_json=self.snapshot_json,
+            model=self.snapshot.model,
+            thinking=self.snapshot.thinking,
+        )
+
+
 def execute_task_run(
     task_id: str,
     *,
     source: RunSource,
     run_id: str | None = None,
 ) -> int:
-    task = get_task(task_id)
-    snapshot = TaskSnapshot.from_task(task)
-    prompt_text, prompt_hash = resolve_prompt_text(task)
-    run_id = run_id or str(uuid.uuid4())
-    session_name = f"pi-task:{task.task_id}:{run_id[:8]}"
-    started = _now()
-    snapshot_json = json.dumps(asdict(snapshot), ensure_ascii=True, sort_keys=True)
+    prepared = PreparedRun.build(task_id, source=source, run_id=run_id)
+    try:
+        with acquire_run_locks(prepared.task.task_id, prepared.task.working_directory):
+            return _execute_locked_run(prepared)
+    except LockConflict as conflict:
+        return _record_lock_conflict(prepared, conflict)
+    except (OSError, RuntimeError) as error:
+        raise TaskError(f"could not acquire run locks: {error}") from error
 
+
+def _reap_orphaned_runs(prepared: PreparedRun) -> None:
+    """Clear history rows left running after a crashed wrapper for these locks."""
+    working_directory = normalize_working_directory(prepared.task.working_directory)
     with open_db() as connection:
-        insert_run(
+        abandoned = abandon_orphaned_runs(
             connection,
-            NewRun(
-                id=run_id,
-                task_id=task.task_id,
-                source=source,
-                started_at=_iso(started),
-                session_name=session_name,
-                prompt_hash=prompt_hash,
-                snapshot_json=snapshot_json,
-                model=snapshot.model,
-                thinking=snapshot.thinking,
-            ),
+            task_id=prepared.task.task_id,
+            working_directory=working_directory,
+            except_run_id=prepared.run_id,
         )
+    for orphan_id in abandoned:
+        _log(f"run {orphan_id}: abandoned after stale lock recovery")
 
-    _log(f"run {run_id}: starting {source} run for task {task.task_id}")
+
+def heal_orphaned_run(run_id: str) -> bool:
+    """If a run is marked running but its locks are free, abandon it and return True.
+
+    Locks are held for the whole abandon so a concurrent live wrapper cannot be
+    misclassified between probe and history update.
+    """
+    with open_db() as connection:
+        record = get_run(connection, run_id)
+        if record is None or record.status != "running":
+            return False
+        try:
+            snapshot = json.loads(record.snapshot_json)
+        except json.JSONDecodeError:
+            return False
+        working_directory = snapshot.get("working_directory")
+        if not isinstance(working_directory, str):
+            return False
+        directory = Path(working_directory)
+        locks = RunLocks(task_id=record.task_id, working_directory=directory)
+        try:
+            locks.acquire()
+        except LockConflict:
+            return False
+        try:
+            abandoned = abandon_orphaned_runs(
+                connection,
+                task_id=record.task_id,
+                working_directory=normalize_working_directory(directory),
+            )
+            return run_id in abandoned
+        finally:
+            locks.release()
+
+
+def _execute_locked_run(prepared: PreparedRun) -> int:
+    _reap_orphaned_runs(prepared)
+    with open_db() as connection:
+        insert_run(connection, prepared.as_new_run())
+
+    task = prepared.task
+    snapshot = prepared.snapshot
+    run_id = prepared.run_id
+    started = prepared.started
+    _log(f"run {run_id}: starting {prepared.source} run for task {task.task_id}")
     pi_executable = resolve_pi()
     command = build_pi_command(
         pi_executable=pi_executable,
         snapshot=snapshot,
-        prompt_text=prompt_text,
-        session_name=session_name,
+        prompt_text=prepared.prompt_text,
+        session_name=prepared.session_name,
     )
 
     observation = StreamObservation()
@@ -356,6 +454,45 @@ def execute_task_run(
     finally:
         for signum, handler in previous_handlers:
             signal.signal(signum, handler)
+
+
+def _record_lock_conflict(prepared: PreparedRun, conflict: LockConflict) -> int:
+    """Record a lock conflict without starting Pi.
+
+    Scheduled conflicts are skipped (exit 0). Manual conflicts fail clearly (exit 1).
+    """
+    if prepared.source == "scheduled":
+        status: RunStatus = "skipped"
+        error = f"skipped: {conflict.message}"
+        exit_code = 0
+    else:
+        status = "failed"
+        error = conflict.message
+        exit_code = 1
+
+    _log(f"run {prepared.run_id}: {error}")
+    with open_db() as connection:
+        insert_run(connection, prepared.as_new_run())
+        finished = _now()
+        duration_ms = max(0, int((finished - prepared.started).total_seconds() * 1000))
+        finish_run(
+            connection,
+            prepared.run_id,
+            RunCompletion(
+                status=status,
+                finished_at=_iso(finished),
+                duration_ms=duration_ms,
+                session_id=None,
+                session_path=None,
+                input_tokens=None,
+                output_tokens=None,
+                cache_read_tokens=None,
+                cache_write_tokens=None,
+                cost_total=None,
+                error=error,
+            ),
+        )
+    return exit_code
 
 
 def _finalize(

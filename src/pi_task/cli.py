@@ -12,7 +12,7 @@ from rich.table import Table
 
 from pi_task.db import RunRecord, get_run, list_runs, open_db
 from pi_task.doctor import run_doctor
-from pi_task.runner import execute_task_run, resolve_pi
+from pi_task.runner import execute_task_run, heal_orphaned_run, resolve_pi
 from pi_task.tasks import (
     Task,
     TaskError,
@@ -522,7 +522,15 @@ def resume_session(
         if record is None:
             raise TaskError(f"run {run_id!r} does not exist")
         if record.status == "running":
-            raise TaskError(f"run {run_id!r} is still active")
+            # Interrupted wrappers leave running rows; free locks mean no live writer.
+            # Always re-read: another process may have reaped the row already.
+            heal_orphaned_run(run_id)
+            with open_db() as connection:
+                record = get_run(connection, run_id)
+            if record is None:
+                raise TaskError(f"run {run_id!r} does not exist")
+            if record.status == "running":
+                raise TaskError(f"run {run_id!r} is still active")
         if not record.session_path:
             raise TaskError(f"run {run_id!r} has no recorded Pi session")
         session_path = Path(record.session_path)

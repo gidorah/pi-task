@@ -165,6 +165,7 @@ raise SystemExit(64)
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
             "XDG_DATA_HOME": str(tmp_path / "data"),
             "XDG_STATE_HOME": str(tmp_path / "state"),
+            "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
             "NO_COLOR": "1",
             "TEST_PROJECT": str(project),
         }
