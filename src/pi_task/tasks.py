@@ -335,7 +335,7 @@ Description=Run pi-task {task.task_id}
 [Service]
 Type=oneshot
 WorkingDirectory={_systemd_quote(str(task.working_directory))}
-ExecStart={_systemd_quote(executable)} _run-scheduled {task.task_id}
+ExecStart={_systemd_quote(executable)} _run-scheduled {task.task_id} --source scheduled
 """
     )
 
