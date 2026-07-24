@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NoReturn
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from pi_task.db import get_run, list_runs, open_db
 from pi_task.doctor import run_doctor
+from pi_task.runner import execute_task_run, resolve_pi
 from pi_task.tasks import (
     Task,
     TaskError,
@@ -63,7 +66,7 @@ def _required(value: str | None, label: str) -> str:
     return value if value is not None else typer.prompt(label)
 
 
-def _task_error(error: TaskError) -> None:
+def _task_error(error: TaskError) -> NoReturn:
     typer.echo(f"Error: {error}", err=True)
     raise typer.Exit(code=1)
 
@@ -392,7 +395,84 @@ def sync() -> None:
 
 
 @app.command("_run-scheduled", hidden=True)
-def run_scheduled(task_id: str) -> None:
-    """Scheduled run boundary implemented by the run-history slice."""
-    typer.echo(f"Scheduled runs are not implemented for {task_id}.", err=True)
-    raise typer.Exit(code=1)
+def run_scheduled(
+    task_id: str = typer.Argument(..., help="Task ID to run."),
+    source: str = typer.Option(
+        "scheduled",
+        "--source",
+        help="Run source recorded in history. Scheduled services pass scheduled.",
+    ),
+) -> None:
+    """Run one scheduled task through the thin Pi wrapper."""
+    try:
+        if source != "scheduled":
+            raise TaskError("scheduled service entrypoint requires --source scheduled")
+        code = execute_task_run(task_id, source="scheduled")
+    except TaskError as error:
+        _task_error(error)
+        raise
+    raise typer.Exit(code=code)
+
+
+@app.command()
+def runs(
+    task_id: str | None = typer.Argument(
+        None,
+        help="Optional task ID to filter run history.",
+    ),
+    limit: int = typer.Option(20, "--limit", help="Maximum runs to display."),
+) -> None:
+    """List recorded runs and their Pi session information."""
+    try:
+        with open_db() as connection:
+            records = list_runs(connection, task_id=task_id, limit=limit)
+    except TaskError as error:
+        _task_error(error)
+    if not records:
+        typer.echo("No runs recorded.")
+        return
+    for index, record in enumerate(records):
+        if index:
+            typer.echo("")
+        duration = (
+            f"{record.duration_ms / 1000:.1f}s" if record.duration_ms is not None else "unknown"
+        )
+        if record.input_tokens is None and record.output_tokens is None:
+            tokens = "unavailable"
+        else:
+            tokens = f"in={record.input_tokens or 0} out={record.output_tokens or 0}"
+        cost = "unavailable" if record.cost_total is None else str(record.cost_total)
+        typer.echo(f"Run: {record.id}")
+        typer.echo(f"Task: {record.task_id}")
+        typer.echo(f"Source: {record.source}")
+        typer.echo(f"Status: {record.status}")
+        typer.echo(f"Duration: {duration}")
+        typer.echo(f"Model: {record.model}")
+        typer.echo(f"Tokens: {tokens}")
+        typer.echo(f"Cost: {cost}")
+        typer.echo(f"Session: {record.session_id or ''}")
+        typer.echo(f"Session path: {record.session_path or ''}")
+
+
+@app.command("resume-session")
+def resume_session(
+    run_id: str = typer.Argument(..., help="Run ID whose Pi session should be opened."),
+) -> None:
+    """Open a completed run through Pi's normal interactive session interface."""
+    try:
+        with open_db() as connection:
+            record = get_run(connection, run_id)
+        if record is None:
+            raise TaskError(f"run {run_id!r} does not exist")
+        if record.status == "running":
+            raise TaskError(f"run {run_id!r} is still active")
+        if not record.session_path:
+            raise TaskError(f"run {run_id!r} has no recorded Pi session")
+        session_path = Path(record.session_path)
+        if not session_path.is_file():
+            raise TaskError(f"recorded session file is missing: {session_path}")
+        pi = resolve_pi()
+    except TaskError as error:
+        _task_error(error)
+        raise
+    raise typer.Exit(code=subprocess.call([pi, "--session", str(session_path)]))

@@ -2,7 +2,7 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Task scheduling lifecycle is available; running tasks is not yet implemented.
+> **Status:** Early development. Scheduled runs into resumable Pi sessions are available; manual runs and overlap protection are not yet implemented.
 
 ## Goals
 
@@ -61,6 +61,16 @@ pi-task remove daily-review --yes
 ```
 
 `edit` validates the full resulting configuration and applies it atomically. Editing or resuming an interval restarts the interval from that moment. `pause` suppresses future scheduled runs without cancelling an active run and clears calendar persistence so paused occurrences are skipped. `resume` schedules only future occurrences. `sync` regenerates units from task definitions and removes generated orphan units. `remove` stops future scheduling and deletes the definition and generated units without touching run or session history.
+
+When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, hashes the resolved prompt, invokes Pi once in `--mode json` with the task model, thinking level, trust policy, working directory, timeout, and a useful session name, then records the run and ordinary Pi session path in SQLite under `$XDG_STATE_HOME/pi-task/runs.db`. Concise lifecycle lines go to the journal; the full JSON event stream does not.
+
+```console
+pi-task runs
+pi-task runs daily-review
+pi-task resume-session RUN_ID
+```
+
+`runs` lists recorded status, duration, model, and session identifiers. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage.
 
 Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
 
