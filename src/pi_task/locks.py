@@ -104,6 +104,7 @@ class RunLocks:
             with suppress(OSError):
                 handle.close()
 
+
 @contextmanager
 def acquire_run_locks(task_id: str, working_directory: Path) -> Iterator[RunLocks]:
     """Acquire task then working-directory locks, or raise LockConflict.
