@@ -223,6 +223,23 @@ def test_malformed_stream_timeout_cancel_and_process_error() -> None:
     )
 
 
+def test_sticky_timeout_beats_late_cancel_flag() -> None:
+    ok = StreamObservation()
+    consume_event_line(
+        ok,
+        json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}}),
+    )
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=True,
+            cancelled=True,
+            observation=ok,
+        )
+        == "timed_out"
+    )
+
+
 def test_find_session_path_can_use_session_id_alone(tmp_path, monkeypatch) -> None:
     from pi_task import runner
 

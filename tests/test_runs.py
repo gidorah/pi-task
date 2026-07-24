@@ -140,7 +140,12 @@ if name == "systemctl":
         if stop_pid:
             try:
                 pid = int(stop_pid)
-                os.kill(pid, signal.SIGTERM)
+                stop_signal = (
+                    signal.SIGKILL
+                    if os.environ.get("FAKE_SYSTEMCTL_STOP_SIGNAL") == "KILL"
+                    else signal.SIGTERM
+                )
+                os.kill(pid, stop_signal)
                 for _ in range(400):
                     try:
                         os.kill(pid, 0)
@@ -759,3 +764,190 @@ def test_cancel_rejects_inactive_and_missing_runs(
     missing = run_cli("cancel", "00000000-0000-0000-0000-000000000000", env=run_env)
     assert missing.returncode != 0
     assert "does not exist" in missing.stderr.lower()
+
+
+def test_cancel_heals_orphaned_running_row_without_systemctl_stop(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """A running history row with free locks is abandoned, not systemctl-stopped."""
+    import uuid
+
+    _add_task(run_cli, run_env, "orphan-cancel")
+    # Ensure schema exists.
+    run_cli("runs", env=run_env)
+    run_id = str(uuid.uuid4())
+    snapshot = {
+        "task_id": "orphan-cancel",
+        "working_directory": run_env["TEST_PROJECT"],
+        "model": "acme/rocket",
+        "thinking": "high",
+        "timeout_seconds": 1200,
+    }
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO runs (
+                id, task_id, source, status, started_at, finished_at, duration_ms,
+                session_id, session_path, session_name, prompt_hash, snapshot_json,
+                model, thinking, input_tokens, output_tokens, cache_read_tokens,
+                cache_write_tokens, cost_total, error
+            ) VALUES (
+                ?, 'orphan-cancel', 'scheduled', 'running', '2030-01-01T00:00:00.000Z',
+                NULL, NULL, NULL, NULL, 'orphan', 'abc', ?, 'acme/rocket', 'high',
+                NULL, NULL, NULL, NULL, NULL, NULL
+            )
+            """,
+            (run_id, json.dumps(snapshot)),
+        )
+        connection.commit()
+
+    _clear_commands(run_env)
+    cancelled = run_cli("cancel", run_id, env=run_env)
+    assert cancelled.returncode != 0, cancelled.stdout + cancelled.stderr
+    assert "no longer active" in cancelled.stderr.lower() or "abandoned" in cancelled.stderr.lower()
+    stop_commands = [
+        command for command in _commands(run_env) if command[0] == "systemctl" and "stop" in command
+    ]
+    assert stop_commands == []
+
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute(
+            "SELECT status, error FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert status == "failed"
+    assert error and "stale lock" in error.lower()
+
+
+def test_cancel_reports_still_running_when_stop_does_not_kill_wrapper(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """Without a real unit mapping, stop is a no-op while locks are held."""
+    import time
+
+    run_env = {**run_env, "FAKE_PI_SLEEP": "30", "FAKE_PI_PARTIAL_SESSION": "1"}
+    _add_task(run_cli, run_env, "still-running")
+    _clear_commands(run_env)
+
+    proc = subprocess.Popen(
+        ["pi-task", "_run-scheduled", "still-running"],
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        run_id = _wait_for_running_run(run_env)
+    except AssertionError:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise AssertionError(f"run never reached Pi: {stdout}{stderr}") from None
+
+    # No FAKE_SYSTEMCTL_STOP_PID: stop succeeds as a log entry but does not kill.
+    _clear_commands(run_env)
+    cancelled = run_cli("cancel", run_id, env=run_env)
+    assert cancelled.returncode != 0, cancelled.stdout + cancelled.stderr
+    assert "not yet recorded" in cancelled.stderr.lower() or "still" in cancelled.stderr.lower()
+    assert proc.poll() is None
+
+    proc.send_signal(signal.SIGTERM)
+    proc.communicate(timeout=15)
+    # Allow cooperative finalize after we kill the wrapper ourselves.
+    deadline = time.time() + 5
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    while time.time() < deadline:
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None and row[0] != "running":
+            break
+        time.sleep(0.05)
+
+
+def test_cancel_force_finalizes_when_wrapper_killed_without_finalize(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """SIGKILL during stop leaves free locks; cancel records cancelled, not failed."""
+    run_env = {**run_env, "FAKE_PI_SLEEP": "30", "FAKE_PI_PARTIAL_SESSION": "1"}
+    _add_task(run_cli, run_env, "force-cancel")
+    _clear_commands(run_env)
+
+    proc = subprocess.Popen(
+        ["pi-task", "_run-scheduled", "force-cancel"],
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        run_id = _wait_for_running_run(run_env)
+    except AssertionError:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise AssertionError(f"run never reached Pi: {stdout}{stderr}") from None
+
+    cancel_env = {
+        **run_env,
+        "FAKE_SYSTEMCTL_STOP_PID": str(proc.pid),
+        "FAKE_SYSTEMCTL_STOP_SIGNAL": "KILL",
+    }
+    _clear_commands(cancel_env)
+    cancelled = run_cli("cancel", run_id, env=cancel_env)
+    proc.communicate(timeout=5)
+    assert cancelled.returncode == 0, cancelled.stdout + cancelled.stderr
+    assert "Cancelled" in cancelled.stdout
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute(
+            "SELECT status, error FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert status == "cancelled"
+    assert error and "cancel" in error.lower()
+
+
+def test_drain_process_preserves_partial_stdout_on_timeout(tmp_path: Path) -> None:
+    from pi_task.runner import _drain_process
+
+    script = tmp_path / "slow_writer.py"
+    script.write_text(
+        "import sys, time\n"
+        'print(\'{"type": "session", "id": "partial-session"}\', flush=True)\n'
+        "time.sleep(30)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # Give the child time to emit the session line before we drain with a short budget.
+        time_module = __import__("time")
+        time_module.sleep(0.2)
+        stdout, _stderr = _drain_process(process, timeout=0.3)
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+    assert "partial-session" in stdout
+
+
+def test_stop_budget_constants_align() -> None:
+    from pi_task.tasks import (
+        PROCESS_DRAIN_SECONDS,
+        PROCESS_FINALIZE_SLACK_SECONDS,
+        PROCESS_KILL_WAIT_SECONDS,
+        PROCESS_TERM_GRACE_SECONDS,
+        SYSTEMCTL_STOP_TIMEOUT_SECONDS,
+        TIMEOUT_STOP_SECONDS,
+    )
+
+    assert TIMEOUT_STOP_SECONDS == (
+        PROCESS_TERM_GRACE_SECONDS
+        + PROCESS_KILL_WAIT_SECONDS
+        + PROCESS_DRAIN_SECONDS
+        + PROCESS_FINALIZE_SLACK_SECONDS
+    )
+    assert SYSTEMCTL_STOP_TIMEOUT_SECONDS > TIMEOUT_STOP_SECONDS

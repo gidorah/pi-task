@@ -120,10 +120,12 @@ def classify_run_status(
     cancelled: bool,
     observation: StreamObservation,
 ) -> TerminalRunStatus:
-    if cancelled:
-        return "cancelled"
+    # Sticky timeout: once the task deadline is decided, a late SIGTERM during
+    # teardown must not reclassify the run as cancelled.
     if timed_out:
         return "timed_out"
+    if cancelled:
+        return "cancelled"
     if process_exit_code is None:
         return "failed"
     if process_exit_code != 0:
