@@ -364,7 +364,7 @@ Description=Run pi-task {task.task_id}
 
 [Service]
 Type=oneshot
-WorkingDirectory={_systemd_quote(str(task.working_directory))}
+WorkingDirectory={task.working_directory!s}
 ExecStart={_systemd_quote(executable)} _run-scheduled {task.task_id} --source scheduled
 RuntimeMaxSec={runtime_max_seconds(task.timeout_seconds)}
 TimeoutStopSec={TIMEOUT_STOP_SECONDS}
