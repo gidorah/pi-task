@@ -176,9 +176,13 @@ def parse_interval(value: str) -> int:
     return parse_duration(value, minimum_seconds=60, what="interval")
 
 
-def validate_model(model: str) -> None:
-    if model.count("/") != 1 or any(character.isspace() for character in model):
-        raise TaskError("model must use the explicit provider/model form")
+def list_available_models() -> list[str]:
+    """Return sorted ``provider/model`` values available to the systemd user manager.
+
+    Uses the same Pi inventory scheduled runs will see. Raises :class:`TaskError`
+    when the manager environment cannot be inspected, Pi cannot list models, or
+    no models are authenticated.
+    """
     systemd_status, manager_environment = systemd_environment_check()
     if manager_environment is None:
         raise TaskError(
@@ -196,6 +200,18 @@ def validate_model(model: str) -> None:
         for line in result.stdout.splitlines()[1:]
         if len(columns := line.split()) >= 2
     }
+    if not available:
+        raise TaskError(
+            "no models are available to the systemd user manager; "
+            "authenticate at least one provider with Pi (see `pi-task doctor`)"
+        )
+    return sorted(available)
+
+
+def validate_model(model: str) -> None:
+    if model.count("/") != 1 or any(character.isspace() for character in model):
+        raise TaskError("model must use the explicit provider/model form")
+    available = set(list_available_models())
     if model not in available:
         raise TaskError(f"model {model!r} is not available to the systemd user manager")
 
