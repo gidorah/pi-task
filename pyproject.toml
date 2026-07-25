@@ -5,10 +5,32 @@ description = "Schedule local Pi agent prompts with systemd user timers"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Onur Akyüz", email = "16724072+gidorah@users.noreply.github.com" },
+]
+keywords = ["pi", "systemd", "scheduler", "agent", "cli", "timers"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
 dependencies = [
     "rich>=14.2.0",
     "typer>=0.21.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gidorah/pi-task"
+Repository = "https://github.com/gidorah/pi-task"
+Issues = "https://github.com/gidorah/pi-task/issues"
 
 [project.scripts]
 pi-task = "pi_task.cli:app"
@@ -25,8 +47,11 @@ requires = ["uv_build>=0.9.11,<0.10.0"]
 build-backend = "uv_build"
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not smoke'"
 testpaths = ["tests"]
+markers = [
+    "smoke: opt-in tests against real systemd and Pi (set PI_TASK_SMOKE=1)",
+]
 
 [tool.ruff]
 target-version = "py314"

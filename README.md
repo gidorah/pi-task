@@ -2,35 +2,87 @@
 
 Schedule local [Pi](https://pi.dev) agent prompts with systemd user timers.
 
-> **Status:** Early development. Scheduled and manual runs into resumable Pi sessions are available with overlap protection, timeouts, and cancellation.
+pi-task is a local command-line tool for recurring and on-demand Pi agent work on a single Linux machine. Each run creates an isolated, resumable Pi session. Task configuration stays in readable TOML; run history lives in SQLite; durable scheduling and process supervision are delegated to the systemd user manager.
 
-## Goals
+## Support boundaries
 
-- Calendar and interval schedules
-- Per-task model and thinking-level selection
-- Persistent, resumable Pi sessions
-- Pause, resume, and independent manual runs
-- Local runs through systemd user services
-- Task and run management through a friendly CLI
+| Supported | Not supported (first version) |
+| --- | --- |
+| Linux with a systemd **user** manager | macOS, Windows, non-systemd schedulers |
+| Python **3.14** | Older Python versions |
+| Single-user local operation | Multi-user / shared-host orchestration |
+| Calendar and interval schedules | Per-task time zones |
+| Manual runs, pause/resume, cancel | Scheduler-level automatic retries |
+| Project trust: inherit / approve / deny | Custom permission systems or tool allowlists |
+| Journald operational logs | GUI / TUI, desktop notifications |
+| Persistent Pi sessions per run | Shared or auto-continued sessions across runs |
 
-## Platform
+Also out of scope: prompt templating, automatic history/session pruning, automatic provider credential management, parallel runs inside one working directory, and recording activations that systemd suppresses before the wrapper starts.
 
-pi-task targets Linux systems with systemd and requires Python 3.14, Pi, and a systemd user manager.
+Arch Linux is the primary development platform; behavior is built on portable systemd user interfaces rather than distribution-specific tooling.
+
+## Prerequisites
+
+1. **Linux + systemd user manager** that can run `systemctl --user`.
+2. **Python 3.14**.
+3. **[uv](https://docs.astral.sh/uv/)** for installation (recommended).
+4. **[Pi](https://pi.dev)** on `PATH`, already authenticated for the models you intend to use.
+5. **User lingering** when tasks must run without an active login session (recommended; see [Lingering](#lingering)).
+
+Provider credentials stay with Pi (or your user-manager environment). pi-task never copies secrets into task storage.
 
 ## Install
 
-Install the command into uv's user-level tool directory:
+Install the command into uv's user-level tool directory from this repository:
 
 ```console
 uv tool install .
+pi-task --version
 pi-task doctor
 ```
 
-`doctor` reports required failures with a nonzero exit status. Disabled user lingering is an actionable warning because scheduled tasks can still run while the user is logged in.
+From a built wheel (release verification path):
 
-## Create a task
+```console
+uv build
+uv tool install dist/pi_task-*.whl
+pi-task --version
+```
 
-Run `pi-task add` without arguments for guided creation, or provide all values for scripted use:
+`doctor` reports required failures with a nonzero exit status. Fix FAIL items before relying on scheduled work. WARN items are actionable but not fatal.
+
+### Shell completion
+
+Typer provides shell completion for bash, zsh, and fish:
+
+```console
+pi-task --install-completion
+# or print the script to review / install manually:
+pi-task --show-completion
+```
+
+Restart the shell (or source your rc file) after installing.
+
+## Lingering
+
+Scheduled tasks run under the **systemd user manager**. When you log out, that manager may stop unless lingering is enabled.
+
+```console
+loginctl enable-linger "$USER"
+pi-task doctor
+```
+
+Disabled lingering is an actionable warning: tasks can still run while you are logged in, but unattended runs after logout may not fire. Enable lingering when automation must survive logout.
+
+## Quick examples
+
+Guided creation:
+
+```console
+pi-task add
+```
+
+Scripted calendar task (weekdays at 09:00 local time):
 
 ```console
 pi-task add daily-review \
@@ -41,50 +93,146 @@ pi-task add daily-review \
   --model openai-codex/gpt-5.4 \
   --thinking high \
   --timeout 30m \
-  --trust inherit
+  --trust inherit \
+  --yes
 ```
 
-Use `--interval 15m` instead of `--calendar` for elapsed interval schedules. Intervals must be at least one minute and first fire one interval after activation. Calendar tasks enable catch-up after machine downtime by default (`--catch-up` / `--no-catch-up`); missed occurrences coalesce through systemd persistence. Interval schedules never replay missed time.
-
-The command validates model availability in the systemd user-manager environment, validates the schedule, previews upcoming calendar occurrences, and asks for confirmation before writing the task definition and activating its user timer. Use exactly one of `--prompt` or `--prompt-file`, exactly one of `--calendar` or `--interval`, `--yes` for non-interactive confirmation, or `--paused` to create configuration and generated units without scheduling it. Inherited project trust emits a warning when Pi has no saved decision for the working directory or one of its parents.
-
-## Manage tasks
-
-Inspect tasks with `pi-task list` and `pi-task show TASK_ID`.
+Interval task (first fire one interval after activation; minimum interval is one minute):
 
 ```console
+pi-task add heartbeat \
+  -C ~/src/project \
+  --prompt "Summarize git status in one sentence." \
+  --interval 15m \
+  --model openai-codex/gpt-5.4 \
+  --thinking low \
+  --yes
+```
+
+Create configuration without enabling the timer (validate first):
+
+```console
+pi-task add trial -C ~/src/project --prompt "ping" --calendar "daily" \
+  --model openai-codex/gpt-5.4 --paused --yes
+pi-task show trial
+pi-task resume trial
+```
+
+Common day-to-day commands:
+
+```console
+pi-task list
+pi-task show daily-review
 pi-task edit daily-review --thinking low --interval 1h
 pi-task pause daily-review
 pi-task resume daily-review
 pi-task sync
+pi-task run daily-review
+pi-task run daily-review --detach
+pi-task runs
+pi-task runs daily-review
+pi-task logs RUN_ID
+pi-task cancel RUN_ID
+pi-task resume-session RUN_ID
 pi-task remove daily-review --yes
 ```
 
-`edit` validates the full resulting configuration and applies it atomically. Editing or resuming an interval restarts the interval from that moment. `pause` suppresses future scheduled runs without cancelling an active run and clears calendar persistence so paused occurrences are skipped. `resume` schedules only future occurrences. `sync` regenerates units from task definitions and removes generated orphan units. `remove` stops future scheduling and deletes the definition and generated units without touching run or session history.
+## Create a task
 
-When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, takes exclusive same-task and same-working-directory locks under `$XDG_RUNTIME_DIR/pi-task/locks`, hashes the resolved prompt, invokes Pi once in `--mode json` with the task model, thinking level, trust policy, working directory, timeout, and a useful session name, then records the run and ordinary Pi session path in SQLite under `$XDG_STATE_HOME/pi-task/runs.db`. A scheduled lock conflict is recorded as skipped without starting Pi; a blocked manual run fails clearly. Tasks in different working directories may run concurrently. Concise lifecycle lines go to the journal; the full JSON event stream does not. An active run's session cannot be opened interactively until the run finishes.
+Every task needs:
+
+| Field | Notes |
+| --- | --- |
+| **Task ID** | Immutable lowercase slug (`daily-review`). Used in units, locks, and filenames. |
+| **Working directory** | Explicit project path; Pi runs there. |
+| **Prompt** | Exactly one of `--prompt` or `--prompt-file`. Submitted exactly as stored (no templating). |
+| **Schedule** | Exactly one of `--calendar` or `--interval`. |
+| **Model** | Available `provider/model` as seen by the systemd user-manager environment. |
+| **Thinking level** | Pi thinking level (`off` … `max`). Default `medium`. |
+| **Timeout** | Default `30m`. Wrapper enforces it; systemd has a slightly longer hard backstop. |
+| **Trust** | `inherit` (default), `approve`, or `deny`. |
+
+Optional: `--name` for a human-readable label, `--catch-up` / `--no-catch-up` for calendar persistence, `--paused` to create without activating the timer, `--yes` to skip confirmation.
+
+`add` validates the model in the user-manager environment, validates the schedule, previews upcoming calendar occurrences, and writes the TOML definition before reconciling generated units. Inherited project trust emits a warning when Pi has no saved decision for the working directory or a parent.
+
+### Schedule forms
+
+**Calendar** — systemd calendar syntax in the machine's local time zone (for example `Mon..Fri 09:00`, `daily`, `*-*-* 12:00:00`). Catch-up after machine downtime is on by default and uses systemd persistence; multiple missed occurrences coalesce into one.
+
+**Interval** — friendly durations such as `15m` or `2h`. First fire is one interval after activation. Missed interval occurrences are never replayed. Intervals faster than one minute are rejected.
+
+### Project trust
+
+| Policy | Behavior |
+| --- | --- |
+| `inherit` | Use Pi's existing saved trust decision for the path (default). |
+| `approve` | Explicitly allow project resources for unattended runs. |
+| `deny` | Explicitly refuse project resources. |
+
+Directories are never silently approved. Prefer `deny` or an already-trusted path for unattended automation.
+
+### Credentials
+
+pi-task does **not** store provider API keys. Use Pi's normal login state, or supply credentials through the systemd user-manager environment if that is how you already run Pi. `doctor` helps confirm the Pi executable and models are visible where scheduled services will run.
+
+## Manage tasks
+
+| Command | Effect |
+| --- | --- |
+| `list` / `show` | Inspect configuration and scheduling state. |
+| `edit` | Validate the full resulting config and apply atomically. Active runs keep their original snapshot. |
+| `pause` | Suppress future scheduled runs and clear calendar persistence. Does **not** cancel an active run. Occurrences missed while paused are skipped. |
+| `resume` | Schedule only future work. Interval schedules restart their interval from resume time. |
+| `sync` | Regenerate units from definitions; remove generated orphans. |
+| `remove` | End future scheduling; delete the definition and generated units. **Preserves** run history and Pi sessions. |
+
+Task definitions live under `$XDG_CONFIG_HOME/pi-task/tasks` (default `~/.config/pi-task/tasks`). Generated units under `$XDG_CONFIG_HOME/systemd/user` are marked as generated — do not edit them by hand; change the TOML and run `sync` or `edit`.
+
+## Runs: scheduled, manual, cancel, history
+
+When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, takes exclusive same-task and same-working-directory locks under `$XDG_RUNTIME_DIR/pi-task/locks`, hashes the resolved prompt, invokes Pi once in `--mode json`, and records the run plus session path in `$XDG_STATE_HOME/pi-task/runs.db`.
+
+| Concern | Behavior |
+| --- | --- |
+| Overlap | Same task cannot overlap; tasks sharing a normalized working directory are serialized; different directories may run concurrently. |
+| Scheduled lock conflict | Recorded as `skipped` when the wrapper starts. Activations systemd suppresses before the wrapper starts are not recorded. |
+| Manual run | `pi-task run TASK_ID` starts a uniquely named transient user service (`--collect`). Waiting is default; `--detach` returns after submission. **Never** starts, stops, or modifies the recurring timer. |
+| Timeout | Wrapper records `timed_out`. Units also set `RuntimeMaxSec` slightly above the task timeout as a hung-wrapper backstop. After upgrades, run `pi-task sync`. |
+| Cancel | `pi-task cancel RUN_ID` stops the supervising unit. Distinct from pause. Status `cancelled`; partial sessions remain. |
+| Success | Normal Pi process exit with a final assistant stop reason indicating completion. Recovered tool errors do not override final success. |
+| Retries | pi-task does not automatically replay failed prompts. |
 
 ```console
-pi-task run daily-review
-pi-task run daily-review --detach
-pi-task cancel RUN_ID
 pi-task runs
-pi-task runs daily-review
+pi-task runs daily-review --limit 50
 pi-task logs RUN_ID
 pi-task resume-session RUN_ID
 ```
 
-`run` starts a uniquely named transient systemd user service (`--collect`) that invokes the same wrapper as a scheduled activation with source `manual`. Waiting for completion is the default and prints the final run status; `--detach` returns after successful submission. Manual runs never enable, disable, restart, or otherwise modify the recurring timer.
+`runs` shows source, status (`succeeded` / `failed` / `skipped` / `cancelled` / `timed_out`), start time, duration, model, thinking, prompt hash, tokens, cost when available, session id/path, and supervising unit / invocation when known.
 
-`cancel` stops a recorded active scheduled or manual run by stopping its systemd user unit. The wrapper forwards termination to Pi with a short grace period, records status `cancelled` (distinct from `timed_out` and `failed`), and keeps any partial Pi session for later inspection or `resume-session`. Pausing a task only suppresses future schedule activations and does not cancel work already running.
+`logs RUN_ID` reads journald for that run. With a stored `INVOCATION_ID`, selection is exact; otherwise it falls back to unit name plus a tight time window. Missing or expired journal lines are explained without changing SQLite history. Concise lifecycle lines go to the journal; the full Pi JSON stream does not — the Pi session remains the canonical detailed history.
 
-The wrapper enforces each task's timeout (default 30 minutes) and records `timed_out` runs. Generated services and manual transient units also set `RuntimeMaxSec` slightly above the task timeout so systemd can kill a hung wrapper as a backstop, and `TimeoutStopSec` so unit stop during cancel stays bounded. After upgrading, run `pi-task sync` so existing scheduled units pick up these service properties. Failed, cancelled, and timed-out runs retain discovered session paths when Pi wrote a session before exiting. pi-task does not automatically replay failed prompts.
+`resume-session` opens a finished run with `pi --session PATH`. Active runs cannot be opened interactively. Failed, cancelled, and timed-out sessions remain available once the run is no longer active.
 
-`runs` lists recorded status (scheduled/manual × succeeded/failed/skipped/cancelled/timed_out), start time, duration, model, thinking level, prompt hash, token usage, cost when available, session identifiers, and the supervising systemd unit and invocation when known. `logs RUN_ID` reads journald for that run: when the wrapper stored an `INVOCATION_ID`, selection is exact (including repeated activations of the same scheduled unit and collected transient manual units); otherwise it falls back to the supervising unit plus a tight time window (best-effort). If journal lines have expired or are missing, `logs` explains the gap without changing retained SQLite run history. `resume-session` opens a completed run through Pi's normal interactive session interface (`pi --session PATH`) without moving the session out of Pi's standard storage. Sessions from failed, cancelled, and timed-out runs remain available once the run is no longer active.
+## Storage and environment
 
-Task definitions are stored below `$XDG_CONFIG_HOME/pi-task/tasks`; generated units below `$XDG_CONFIG_HOME/systemd/user` should not be edited directly.
+| Location | Content |
+| --- | --- |
+| `$XDG_CONFIG_HOME/pi-task/tasks` | Human-readable task TOML (source of truth) |
+| `$XDG_CONFIG_HOME/systemd/user` | Generated `pi-task-*.service` / `.timer` units |
+| `$XDG_STATE_HOME/pi-task/runs.db` | Run and session metadata |
+| `$XDG_RUNTIME_DIR/pi-task/locks` | Same-task and working-directory locks |
+| Pi's normal session storage | Conversation transcripts |
 
-For isolated testing, dependency executables can be selected through `PATH` or the `PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, `PI_TASK_SYSTEMD_RUN_EXECUTABLE`, `PI_TASK_EXECUTABLE`, `PI_TASK_JOURNALCTL_EXECUTABLE`, and `PI_TASK_LOGINCTL_EXECUTABLE` environment variables. A Pi override must also be present in the systemd user manager environment, as it will be for scheduled runs. Set `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` to keep diagnostics out of real user locations.
+For isolated testing, dependency executables can be selected through `PATH` or:
+
+`PI_TASK_PI_EXECUTABLE`, `PI_TASK_SYSTEMCTL_EXECUTABLE`, `PI_TASK_SYSTEMD_ANALYZE_EXECUTABLE`, `PI_TASK_SYSTEMD_RUN_EXECUTABLE`, `PI_TASK_EXECUTABLE`, `PI_TASK_JOURNALCTL_EXECUTABLE`, `PI_TASK_LOGINCTL_EXECUTABLE`.
+
+A Pi override must also be present in the systemd user manager environment for scheduled runs. Point `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` at temporary directories to keep diagnostics and automated tests out of real user locations.
+
+**No automated test or release command silently creates real scheduled work.** The default test suite uses fakes and isolated XDG directories. The optional smoke test creates only a paused disposable task and always removes it (see below).
 
 ## Development
 
@@ -94,9 +242,26 @@ uv run ruff format --check .
 uv run ruff check .
 uv run ty check
 uv run pytest
+uv build
 ```
 
-The automated tests use isolated XDG directories and fake Pi and systemd-family executables. They do not call real Pi or modify the developer's systemd state.
+The automated suite uses isolated XDG directories and fake Pi / systemd-family executables. It does not call real Pi or modify the developer's systemd state. Smoke tests are excluded by default (`-m 'not smoke'`).
+
+### Opt-in smoke test
+
+Exercise a disposable **paused** task against the real user manager and Pi (never part of normal CI):
+
+```console
+PI_TASK_SMOKE=1 uv run pytest -m smoke
+# optional model pin:
+PI_TASK_SMOKE=1 PI_TASK_SMOKE_MODEL=provider/model uv run pytest -m smoke
+```
+
+Requires a working Pi login, models visible to Pi, and a running systemd user manager. The test runs one manual invocation and removes the task afterward. It will not leave an enabled timer.
+
+### Continuous integration
+
+GitHub Actions runs lockfile sync, Ruff, ty, pytest (without smoke), packaging build, and installation verification on Python 3.14 only.
 
 ## License
 

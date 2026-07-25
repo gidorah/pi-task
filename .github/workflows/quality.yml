@@ -24,3 +24,10 @@ jobs:
         run: uv run ty check
       - name: Test
         run: uv run pytest
+      - name: Build package
+        run: uv build
+      - name: Verify installation
+        run: |
+          uv venv --python 3.14 "$RUNNER_TEMP/pi-task-install"
+          uv pip install --python "$RUNNER_TEMP/pi-task-install/bin/python" dist/*.whl
+          "$RUNNER_TEMP/pi-task-install/bin/pi-task" --version
