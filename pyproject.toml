@@ -1,6 +1,6 @@
 [project]
 name = "pi-task"
-version = "0.1.0"
+version = "0.1.2"
 description = "Schedule local Pi agent prompts with systemd user timers"
 readme = "README.md"
 requires-python = ">=3.14"
