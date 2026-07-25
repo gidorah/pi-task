@@ -15,6 +15,8 @@ from pi_task.doctor import run_doctor
 from pi_task.journal import missing_journal_message, read_run_journal
 from pi_task.runner import cancel_run, execute_task_run, heal_orphaned_run, resolve_pi
 from pi_task.tasks import (
+    THINKING_LEVELS,
+    TRUST_POLICIES,
     Task,
     TaskError,
     all_tasks,
@@ -31,6 +33,20 @@ from pi_task.tasks import (
     update_task,
     validate_task,
 )
+
+# Interactive prompt labels: short enough for a terminal, with examples or choices.
+_PROMPT_TASK_ID = "Task ID (e.g. daily-review; lowercase letters, numbers, hyphens)"
+_PROMPT_WORKING_DIRECTORY = "Working directory (e.g. ~/projects/app; ~ is expanded)"
+_PROMPT_SOURCE = "Prompt source (inline|file)"
+_PROMPT_INLINE = "Prompt"
+_PROMPT_FILE = "Prompt file (e.g. ~/prompts/review.md; ~ is expanded)"
+_PROMPT_SCHEDULE_KIND = "Schedule kind (calendar|interval)"
+_PROMPT_CALENDAR = "Calendar schedule (e.g. daily, Mon..Fri 09:00)"
+_PROMPT_INTERVAL = "Interval (e.g. 15m, 2h; minimum 1m)"
+_PROMPT_MODEL = "Model (provider/model, e.g. anthropic/claude-sonnet-4-5)"
+_PROMPT_THINKING = f"Thinking ({'|'.join(THINKING_LEVELS)})"
+_PROMPT_TIMEOUT = "Timeout (e.g. 30m, 2h, 45s)"
+_PROMPT_TRUST = f"Trust ({'|'.join(TRUST_POLICIES)})"
 
 app = typer.Typer(
     help="Schedule local Pi agent prompts with systemd user timers.",
@@ -137,11 +153,11 @@ def _resolve_prompt(
     if prompt is None and prompt_file is None:
         if not interactive:
             raise TaskError("provide exactly one of --prompt and --prompt-file")
-        source = typer.prompt("Prompt source", default="inline").strip().lower()
+        source = typer.prompt(_PROMPT_SOURCE, default="inline").strip().lower()
         if source == "inline":
-            prompt = typer.prompt("Prompt")
+            prompt = typer.prompt(_PROMPT_INLINE)
         elif source == "file":
-            prompt_file = typer.prompt("Prompt file")
+            prompt_file = typer.prompt(_PROMPT_FILE)
         else:
             raise TaskError("prompt source must be inline or file")
     if prompt_file is not None:
@@ -163,26 +179,42 @@ def _resolve_schedule(
         return "calendar", calendar
     if not interactive:
         raise TaskError("provide exactly one of --calendar and --interval")
-    return "calendar", _required(None, "Calendar schedule")
+    kind = typer.prompt(_PROMPT_SCHEDULE_KIND, default="calendar").strip().lower()
+    if kind == "calendar":
+        return "calendar", _required(None, _PROMPT_CALENDAR)
+    if kind == "interval":
+        return "interval", _required(None, _PROMPT_INTERVAL)
+    raise TaskError("schedule kind must be calendar or interval")
 
 
 @app.command()
 def add(
-    task_id: str | None = typer.Argument(None, help="Lowercase machine-safe task ID."),
+    task_id: str | None = typer.Argument(
+        None,
+        help="Lowercase machine-safe task ID (e.g. daily-review).",
+    ),
     name: str | None = typer.Option(None, "--name", help="Optional display name."),
     working_directory: str | None = typer.Option(
         None,
         "--working-directory",
         "-C",
-        help="Directory in which Pi will work.",
+        help="Directory in which Pi will work (e.g. ~/projects/app; ~ is expanded).",
     ),
     prompt: str | None = typer.Option(None, "--prompt", help="Inline prompt text."),
-    prompt_file: str | None = typer.Option(None, "--prompt-file", help="Path to a prompt file."),
-    calendar: str | None = typer.Option(None, "--calendar", help="systemd calendar expression."),
+    prompt_file: str | None = typer.Option(
+        None,
+        "--prompt-file",
+        help="Path to a prompt file (e.g. ~/prompts/review.md; ~ is expanded).",
+    ),
+    calendar: str | None = typer.Option(
+        None,
+        "--calendar",
+        help="systemd calendar expression (e.g. daily, Mon..Fri 09:00).",
+    ),
     interval: str | None = typer.Option(
         None,
         "--interval",
-        help="Elapsed interval duration such as 15m or 2h.",
+        help="Elapsed interval duration such as 15m or 2h (minimum 1m).",
     ),
     catch_up: bool | None = typer.Option(
         None,
@@ -190,19 +222,35 @@ def add(
         help="For calendar tasks, coalesce missed occurrences after downtime.",
         show_default=False,
     ),
-    model: str | None = typer.Option(None, "--model", help="Available model as provider/model."),
-    thinking: str = typer.Option("medium", "--thinking", help="Pi thinking level."),
-    timeout: str = typer.Option("30m", "--timeout", help="Run timeout, such as 30m or 2h."),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Available model as provider/model (e.g. anthropic/claude-sonnet-4-5).",
+    ),
+    thinking: str = typer.Option(
+        "medium",
+        "--thinking",
+        help=f"Pi thinking level: {', '.join(THINKING_LEVELS)}.",
+    ),
+    timeout: str = typer.Option(
+        "30m",
+        "--timeout",
+        help="Run timeout duration such as 30m, 2h, or 45s.",
+    ),
     trust: str = typer.Option(
-        "inherit", "--trust", help="Project trust: inherit, approve, or deny."
+        "inherit",
+        "--trust",
+        help=f"Project trust: {', '.join(TRUST_POLICIES)}.",
     ),
     paused: bool = typer.Option(False, "--paused", help="Create without activating the timer."),
     accept: bool = typer.Option(False, "--yes", "-y", help="Accept the schedule preview."),
 ) -> None:
     """Create and optionally activate a scheduled task."""
     try:
-        resolved_id = _required(task_id, "Task ID")
-        resolved_directory = Path(_required(working_directory, "Working directory")).expanduser()
+        resolved_id = _required(task_id, _PROMPT_TASK_ID)
+        resolved_directory = Path(
+            _required(working_directory, _PROMPT_WORKING_DIRECTORY)
+        ).expanduser()
         interactive = task_id is None or working_directory is None
         prompt_kind, prompt_value = _resolve_prompt(
             prompt,
@@ -220,6 +268,12 @@ def add(
             resolved_catch_up = False
         else:
             resolved_catch_up = True if catch_up is None else catch_up
+        resolved_model = _required(model, _PROMPT_MODEL)
+        if interactive:
+            # Surface defaults and allowed values/examples in the guided wizard.
+            thinking = typer.prompt(_PROMPT_THINKING, default=thinking).strip()
+            timeout = typer.prompt(_PROMPT_TIMEOUT, default=timeout).strip()
+            trust = typer.prompt(_PROMPT_TRUST, default=trust).strip()
         task = Task(
             task_id=resolved_id,
             name=name,
@@ -229,7 +283,7 @@ def add(
             schedule_kind=schedule_kind,
             schedule=schedule_value,
             catch_up=resolved_catch_up,
-            model=_required(model, "Model (provider/model)"),
+            model=resolved_model,
             thinking=thinking,
             timeout_seconds=parse_timeout(timeout),
             trust=trust,

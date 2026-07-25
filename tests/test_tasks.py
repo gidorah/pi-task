@@ -277,17 +277,33 @@ def test_add_guides_omitted_required_values_and_can_create_paused(
         env=task_env,
         input=(
             f"guided-task\n{task_env['TEST_PROJECT']}\nfile\n"
-            f"{task_env['TEST_PROMPT_FILE']}\ndaily\nacme/rocket\ny\n"
+            f"{task_env['TEST_PROMPT_FILE']}\ncalendar\ndaily\nacme/rocket\n"
+            # Accept defaults for thinking / timeout / trust.
+            "\n\n\ny\n"
         ),
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    # Prompt labels include examples and allowed options (issue #22).
     assert "Task ID" in result.stdout
+    assert "daily-review" in result.stdout
     assert "Working directory" in result.stdout
+    assert "~" in result.stdout
     assert "Prompt source" in result.stdout
+    assert "inline" in result.stdout and "file" in result.stdout
     assert "Prompt file" in result.stdout
+    assert "Schedule kind" in result.stdout
+    assert "calendar" in result.stdout and "interval" in result.stdout
     assert "Calendar schedule" in result.stdout
-    assert "Model (provider/model)" in result.stdout
+    assert "daily" in result.stdout
+    assert "Model" in result.stdout
+    assert "provider/model" in result.stdout
+    assert "Thinking" in result.stdout
+    assert "off" in result.stdout and "medium" in result.stdout
+    assert "Timeout" in result.stdout
+    assert "30m" in result.stdout
+    assert "Trust" in result.stdout
+    assert "inherit" in result.stdout and "approve" in result.stdout
     assert "Created paused task guided-task" in result.stdout
     assert "project has no saved Pi trust decision" in result.stdout
 
@@ -311,6 +327,50 @@ def test_add_guides_omitted_required_values_and_can_create_paused(
     task_env["FAKE_UNIT_ACTIVE"] = "active"
     drifted = run_cli("show", "guided-task", env=task_env)
     assert "State: paused (timer is enabled, active)" in drifted.stdout
+
+
+def test_add_guides_interval_schedule_with_examples(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_cli(
+        "add",
+        "--paused",
+        env=task_env,
+        input=(
+            f"interval-guided\n{task_env['TEST_PROJECT']}\ninline\n"
+            f"Inspect the project.\ninterval\n15m\nacme/rocket\n"
+            "\n\n\ny\n"
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Schedule kind" in result.stdout
+    assert "Interval" in result.stdout
+    assert "15m" in result.stdout
+    assert "Timeout" in result.stdout
+    assert "Created paused task interval-guided" in result.stdout
+    shown = run_cli("show", "interval-guided", env=task_env)
+    assert shown.returncode == 0
+    assert "every 15m" in shown.stdout
+
+
+def test_add_help_lists_examples_and_choice_values(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    result = run_cli("add", "--help", env=task_env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    help_text = result.stdout
+    # Rich wraps option help; assert distinctive tokens rather than full phrases.
+    assert "daily-review" in help_text
+    assert "Mon..Fri" in help_text and "09:00" in help_text
+    assert "15m" in help_text and "minimum" in help_text
+    assert "provider/model" in help_text
+    assert "off" in help_text and "xhigh" in help_text and "max" in help_text
+    assert "30m" in help_text and "45s" in help_text
+    assert "inherit" in help_text and "approve" in help_text and "deny" in help_text
 
 
 @pytest.mark.parametrize(
