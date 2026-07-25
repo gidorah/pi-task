@@ -23,6 +23,7 @@ from pi_task.tasks import (
     create_task,
     get_task,
     has_saved_project_trust,
+    list_available_models,
     parse_timeout,
     pause_task,
     remove_task,
@@ -44,6 +45,7 @@ _PROMPT_SCHEDULE_KIND = "Schedule kind (calendar|interval)"
 _PROMPT_CALENDAR = "Calendar schedule (e.g. daily, Mon..Fri 09:00)"
 _PROMPT_INTERVAL = "Interval (e.g. 15m, 2h; minimum 1m)"
 _PROMPT_MODEL = "Model (provider/model, e.g. anthropic/claude-sonnet-4-5)"
+_PROMPT_MODEL_CHOICE = "Model (number or provider/model)"
 _PROMPT_THINKING = f"Thinking ({'|'.join(THINKING_LEVELS)})"
 _PROMPT_TIMEOUT = "Timeout (e.g. 30m, 2h, 45s)"
 _PROMPT_TRUST = f"Trust ({'|'.join(TRUST_POLICIES)})"
@@ -187,6 +189,42 @@ def _resolve_schedule(
     raise TaskError("schedule kind must be calendar or interval")
 
 
+def _resolve_model(model: str | None) -> str:
+    """Resolve ``--model`` or prompt interactively with a live inventory.
+
+    Non-interactive callers that already passed ``--model`` get that value
+    unchanged. When the flag is omitted, list models from the user-manager
+    environment so the user can pick by index or type ``provider/model``.
+    Listing failures are explained but still allow manual entry.
+    """
+    if model is not None:
+        return model
+    try:
+        available = list_available_models()
+    except TaskError as error:
+        typer.echo(f"Could not list models: {error}", err=True)
+        typer.echo(
+            "Authenticate providers with Pi, run `pi-task doctor`, "
+            "or type provider/model manually.",
+            err=True,
+        )
+        return typer.prompt(_PROMPT_MODEL).strip()
+
+    typer.echo("Available models:")
+    for index, name in enumerate(available, start=1):
+        typer.echo(f"  {index}. {name}")
+    choice = typer.prompt(_PROMPT_MODEL_CHOICE).strip()
+    if choice.isdigit():
+        selected = int(choice)
+        if 1 <= selected <= len(available):
+            return available[selected - 1]
+        raise TaskError(
+            f"model selection must be between 1 and {len(available)} "
+            f"(or type a full provider/model name)"
+        )
+    return choice
+
+
 @app.command()
 def add(
     task_id: str | None = typer.Argument(
@@ -268,7 +306,7 @@ def add(
             resolved_catch_up = False
         else:
             resolved_catch_up = True if catch_up is None else catch_up
-        resolved_model = _required(model, _PROMPT_MODEL)
+        resolved_model = _resolve_model(model)
         if interactive:
             # Surface defaults and allowed values/examples in the guided wizard.
             thinking = typer.prompt(_PROMPT_THINKING, default=thinking).strip()

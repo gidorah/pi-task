@@ -60,6 +60,8 @@ if name == "systemctl":
                 os.environ.get("FAKE_MODELS", "provider model context\\nacme rocket 128K"),
             ),
         }
+        if "FAKE_MODELS_EXIT" in os.environ:
+            environment["FAKE_MODELS_EXIT"] = os.environ["FAKE_MODELS_EXIT"]
         if "--output=json" in sys.argv:
             print(json.dumps(environment))
         else:
@@ -296,6 +298,8 @@ def test_add_guides_omitted_required_values_and_can_create_paused(
     assert "calendar" in result.stdout and "interval" in result.stdout
     assert "Calendar schedule" in result.stdout
     assert "daily" in result.stdout
+    assert "Available models" in result.stdout
+    assert "acme/rocket" in result.stdout
     assert "Model" in result.stdout
     assert "provider/model" in result.stdout
     assert "Thinking" in result.stdout
@@ -355,6 +359,89 @@ def test_add_guides_interval_schedule_with_examples(
     assert "every 15m" in shown.stdout
 
 
+def test_interactive_add_lists_available_models_and_accepts_full_name(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    task_env["FAKE_MODELS"] = (
+        "provider model context\nacme rocket 128K\nopenai gpt-4 128K\nzed spark 64K"
+    )
+
+    result = run_cli(
+        "add",
+        "--paused",
+        env=task_env,
+        input=(
+            f"list-models\n{task_env['TEST_PROJECT']}\ninline\n"
+            f"Inspect the project.\ncalendar\ndaily\nacme/rocket\n"
+            "\n\n\ny\n"
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Available models" in result.stdout
+    assert "1." in result.stdout and "acme/rocket" in result.stdout
+    assert "openai/gpt-4" in result.stdout
+    assert "zed/spark" in result.stdout
+    assert "Created paused task list-models" in result.stdout
+    assert ["pi", "--list-models"] in _commands(task_env)
+    task_text = (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/list-models.toml").read_text()
+    assert 'model = "acme/rocket"' in task_text
+
+
+def test_interactive_add_selects_model_by_list_index(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    task_env["FAKE_MODELS"] = (
+        "provider model context\nacme rocket 128K\nopenai gpt-4 128K\nzed spark 64K"
+    )
+
+    result = run_cli(
+        "add",
+        "--paused",
+        env=task_env,
+        input=(
+            f"pick-by-index\n{task_env['TEST_PROJECT']}\ninline\n"
+            f"Inspect the project.\ncalendar\ndaily\n2\n"
+            "\n\n\ny\n"
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Available models" in result.stdout
+    assert "Created paused task pick-by-index" in result.stdout
+    task_text = (Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/pick-by-index.toml").read_text()
+    # Sorted inventory: acme/rocket, openai/gpt-4, zed/spark
+    assert 'model = "openai/gpt-4"' in task_text
+
+
+def test_interactive_add_explains_when_model_listing_fails(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    task_env["FAKE_MODELS_EXIT"] = "1"
+
+    result = run_cli(
+        "add",
+        "--paused",
+        env=task_env,
+        input=(
+            f"list-fail\n{task_env['TEST_PROJECT']}\ninline\n"
+            f"Inspect the project.\ncalendar\ndaily\nacme/rocket\n"
+            "\n\n\ny\n"
+        ),
+    )
+
+    combined = (result.stdout + result.stderr).lower()
+    assert result.returncode == 1
+    assert "could not list models" in combined or "could not inspect models" in combined
+    assert "doctor" in combined or "authenticate" in combined
+    # Manual entry is still offered instead of a silent empty chooser.
+    assert "Model" in result.stdout
+    assert "Available models" not in result.stdout
+
+
 def test_add_help_lists_examples_and_choice_values(
     task_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
@@ -389,7 +476,7 @@ def test_add_help_lists_examples_and_choice_values(
             {},
             "exactly one",
         ),
-        (("missing-model",), {"FAKE_MODELS": "provider model\\nother model"}, "not available"),
+        (("missing-model",), {"FAKE_MODELS": "provider model\nother model"}, "not available"),
         (("rapid",), {"FAKE_CALENDAR_FAST": "1"}, "no faster than once per minute"),
         (("bad-calendar",), {"FAKE_CALENDAR_EXIT": "1"}, "invalid calendar schedule"),
     ],
@@ -430,7 +517,7 @@ def test_model_must_be_available_to_the_systemd_user_manager(
     task_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    task_env["FAKE_MANAGER_MODELS"] = "provider model context\\nother model 128K"
+    task_env["FAKE_MANAGER_MODELS"] = "provider model context\nother model 128K"
 
     result = run_cli(
         "add",
