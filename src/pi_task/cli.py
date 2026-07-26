@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from pi_task.db import RunRecord, get_run, list_runs, open_db
+from pi_task.db import RunRecord, get_run, latest_run_for_task, list_runs, open_db
 from pi_task.doctor import run_doctor
 from pi_task.journal import missing_journal_message, read_run_journal
 from pi_task.runner import cancel_run, execute_task_run, heal_orphaned_run, resolve_pi
@@ -678,29 +678,47 @@ def logs(
 
 @app.command("resume-session")
 def resume_session(
-    run_id: str = typer.Argument(..., help="Run ID whose Pi session should be opened."),
+    task_id: str = typer.Argument(
+        ...,
+        help="Task ID whose newest run's Pi session should be opened.",
+    ),
 ) -> None:
-    """Open a completed run through Pi's normal interactive session interface."""
+    """Open the newest run for a task through Pi's interactive session interface.
+
+    Selection is by recency only — succeeded, failed, cancelled, and timed-out
+    runs are all eligible when they still have a recorded session file.
+    """
     try:
         with open_db() as connection:
-            record = get_run(connection, run_id)
+            record = latest_run_for_task(connection, task_id)
         if record is None:
-            raise TaskError(f"run {run_id!r} does not exist")
+            raise TaskError(
+                f"task {task_id!r} has no runs; run it first with `pi-task run {task_id}`"
+            )
         if record.status == "running":
             # Interrupted wrappers leave running rows; free locks mean no live writer.
             # Always re-read: another process may have reaped the row already.
-            heal_orphaned_run(run_id)
+            heal_orphaned_run(record.id)
             with open_db() as connection:
-                record = get_run(connection, run_id)
+                record = latest_run_for_task(connection, task_id)
             if record is None:
-                raise TaskError(f"run {run_id!r} does not exist")
+                raise TaskError(
+                    f"task {task_id!r} has no runs; run it first with `pi-task run {task_id}`"
+                )
             if record.status == "running":
-                raise TaskError(f"run {run_id!r} is still active")
+                raise TaskError(f"newest run {record.id!r} for task {task_id!r} is still active")
         if not record.session_path:
-            raise TaskError(f"run {run_id!r} has no recorded Pi session")
+            raise TaskError(
+                f"newest run {record.id!r} for task {task_id!r} "
+                f"({record.status}) has no recorded Pi session to resume; "
+                f"inspect with `pi-task runs {task_id}`"
+            )
         session_path = Path(record.session_path)
         if not session_path.is_file():
-            raise TaskError(f"recorded session file is missing: {session_path}")
+            raise TaskError(
+                f"recorded session file is missing for newest run {record.id!r}: "
+                f"{session_path}; inspect with `pi-task runs {task_id}`"
+            )
         pi = resolve_pi()
     except TaskError as error:
         _task_error(error)

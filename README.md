@@ -133,7 +133,7 @@ pi-task runs
 pi-task runs daily-review
 pi-task logs RUN_ID
 pi-task cancel RUN_ID
-pi-task resume-session RUN_ID
+pi-task resume-session daily-review
 pi-task remove daily-review --yes
 ```
 
@@ -207,14 +207,14 @@ When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID -
 pi-task runs
 pi-task runs daily-review --limit 50
 pi-task logs RUN_ID
-pi-task resume-session RUN_ID
+pi-task resume-session daily-review
 ```
 
 `runs` shows source, status (`succeeded` / `failed` / `skipped` / `cancelled` / `timed_out`), start time, duration, model, thinking, prompt hash, tokens, cost when available, session id/path, and supervising unit / invocation when known.
 
 `logs RUN_ID` reads journald for that run. With a stored `INVOCATION_ID`, selection is exact; otherwise it falls back to unit name plus a tight time window. Missing or expired journal lines are explained without changing SQLite history. Concise lifecycle lines go to the journal; the full Pi JSON stream does not — the Pi session remains the canonical detailed history.
 
-`resume-session` opens a finished run with `pi --session PATH`. Active runs cannot be opened interactively. Failed, cancelled, and timed-out sessions remain available once the run is no longer active.
+`resume-session TASK_ID` opens the newest run for that task with `pi --session PATH`, whether the run succeeded or ended unsuccessfully. Active runs cannot be opened interactively. Failed, cancelled, and timed-out sessions remain available once the run is no longer active.
 
 ## Storage and environment
 
