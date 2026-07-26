@@ -516,6 +516,41 @@ def test_run_keeps_startup_snapshot_after_task_edit(
     assert snapshot["paused"] is False
 
 
+def test_resume_session_errors_when_newest_run_has_no_session(
+    lock_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """Newest skipped run must not fall back to an older successful session."""
+    _add_task(run_cli, lock_env, "no-session")
+    _clear_commands(lock_env)
+
+    first = _start_gated_run(lock_env, "no-session")
+    try:
+        second = run_cli(
+            "_run-scheduled",
+            "no-session",
+            env=_immediate_env(lock_env, "second"),
+        )
+        assert second.returncode == 0, second.stdout + second.stderr
+    finally:
+        _release_gate(lock_env)
+        stdout, stderr = first.communicate(timeout=15)
+        assert first.returncode == 0, stdout + stderr
+
+    rows = _db_rows(lock_env)
+    assert sorted(row[2] for row in rows) == ["skipped", "succeeded"]
+
+    _clear_commands(lock_env)
+    missing = run_cli("resume-session", "no-session", env=lock_env)
+    assert missing.returncode != 0
+    assert "no-session" in missing.stderr
+    assert "no recorded" in missing.stderr.lower() or "no session" in missing.stderr.lower()
+    session_opens = [
+        command for command in _commands(lock_env) if command[0] == "pi" and "--session" in command
+    ]
+    assert session_opens == []
+
+
 def test_resume_session_refuses_active_run(
     lock_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
@@ -540,7 +575,7 @@ def test_resume_session_refuses_active_run(
             time.sleep(0.05)
         assert run_id is not None
 
-        refused = run_cli("resume-session", run_id, env=lock_env)
+        refused = run_cli("resume-session", "active-session", env=lock_env)
         assert refused.returncode != 0
         assert "active" in refused.stderr.lower() or "running" in refused.stderr.lower()
         session_opens = [
@@ -631,9 +666,14 @@ def test_resume_session_heals_orphaned_running_row(
     first.wait(timeout=5)
 
     # No session was finalized; heal must clear running so the refusal is not permanent.
-    refused_or_missing = run_cli("resume-session", run_id, env=lock_env)
+    refused_or_missing = run_cli("resume-session", "orphan-resume", env=lock_env)
     assert refused_or_missing.returncode != 0
     assert "active" not in refused_or_missing.stderr.lower()
+    assert (
+        "no recorded" in refused_or_missing.stderr.lower()
+        or "no session" in refused_or_missing.stderr.lower()
+        or "missing" in refused_or_missing.stderr.lower()
+    )
     with sqlite3.connect(db_path) as connection:
         status = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
     assert status is not None

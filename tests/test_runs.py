@@ -150,13 +150,68 @@ def test_resume_session_opens_recorded_pi_session(
 
     db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
     with sqlite3.connect(db_path) as connection:
-        run_id, session_path = connection.execute("SELECT id, session_path FROM runs").fetchone()
+        session_path = connection.execute("SELECT session_path FROM runs").fetchone()[0]
 
     _clear_commands(run_env)
-    resumed = run_cli("resume-session", run_id, env=run_env)
+    resumed = run_cli("resume-session", "resume-me", env=run_env)
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr
     pi_commands = [command for command in _commands(run_env) if command[0] == "pi"]
     assert pi_commands == [["pi", "--session", session_path]]
+
+
+def test_resume_session_selects_newest_run_even_when_unsuccessful(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """Newest run wins even when an older successful run exists."""
+    _add_task(run_cli, run_env, "pick-latest")
+    _clear_commands(run_env)
+
+    first = run_cli("_run-scheduled", "pick-latest", env=run_env)
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        older_session = connection.execute(
+            "SELECT session_path FROM runs ORDER BY started_at ASC"
+        ).fetchone()[0]
+
+    fail_env = {
+        **run_env,
+        "FAKE_STOP_REASON": "length",
+        "FAKE_SESSION_ID": "019f0000-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "FAKE_SESSION_TIMESTAMP": "2030-01-07T10:00:00.000Z",
+    }
+    _clear_commands(fail_env)
+    second = run_cli("_run-scheduled", "pick-latest", env=fail_env)
+    assert second.returncode != 0, second.stdout + second.stderr
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT status, session_path FROM runs ORDER BY started_at DESC"
+        ).fetchall()
+    assert len(rows) == 2
+    assert rows[0][0] == "failed"
+    newer_session = rows[0][1]
+    assert newer_session != older_session
+    assert Path(newer_session).is_file()
+
+    _clear_commands(run_env)
+    resumed = run_cli("resume-session", "pick-latest", env=run_env)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    pi_commands = [command for command in _commands(run_env) if command[0] == "pi"]
+    assert pi_commands == [["pi", "--session", newer_session]]
+
+
+def test_resume_session_errors_when_task_has_no_runs(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "never-ran")
+    missing = run_cli("resume-session", "never-ran", env=run_env)
+    assert missing.returncode != 0
+    assert "never-ran" in missing.stderr
+    assert "no runs" in missing.stderr.lower()
 
 
 def test_service_unit_invokes_wrapper_with_task_identity(
@@ -373,9 +428,7 @@ def test_wrapper_timeout_records_timed_out_with_partial_session(
     assert error and "timed out" in error.lower()
 
     # Partial timed-out sessions remain openable through resume-session.
-    with sqlite3.connect(db_path) as connection:
-        run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
-    resumed = run_cli("resume-session", run_id, env=run_env)
+    resumed = run_cli("resume-session", "timeout-me", env=run_env)
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr
 
 
@@ -404,9 +457,7 @@ def test_failed_run_keeps_partial_session_and_classifies_stop_reasons(
     assert session_path is not None and Path(session_path).is_file()
     assert error and "length" in error.lower()
 
-    with sqlite3.connect(db_path) as connection:
-        run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
-    resumed = run_cli("resume-session", run_id, env=run_env)
+    resumed = run_cli("resume-session", "fail-length", env=run_env)
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr
 
 

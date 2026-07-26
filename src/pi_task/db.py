@@ -310,6 +310,12 @@ def get_run(connection: sqlite3.Connection, run_id: str) -> RunRecord | None:
     return _row_to_run(row) if row is not None else None
 
 
+def latest_run_for_task(connection: sqlite3.Connection, task_id: str) -> RunRecord | None:
+    """Return the newest run for a task by start time, regardless of status."""
+    rows = list_runs(connection, task_id=task_id, limit=1)
+    return rows[0] if rows else None
+
+
 def list_running_runs(connection: sqlite3.Connection) -> list[RunRecord]:
     rows = connection.execute("SELECT * FROM runs WHERE status = 'running'").fetchall()
     return [_row_to_run(row) for row in rows]
