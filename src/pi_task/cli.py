@@ -13,6 +13,17 @@ from rich.table import Table
 from pi_task.db import RunRecord, get_run, latest_run_for_task, list_runs, open_db
 from pi_task.doctor import run_doctor
 from pi_task.journal import missing_journal_message, read_run_journal
+from pi_task.notify import (
+    NotificationPayload,
+    NotifyConfig,
+    NotifyError,
+    format_config_for_display,
+    load_notify_config,
+    parse_trigger_choice,
+    publish_notification,
+    save_notify_config,
+    trigger_choice,
+)
 from pi_task.runner import cancel_run, execute_task_run, heal_orphaned_run, resolve_pi
 from pi_task.tasks import (
     THINKING_LEVELS,
@@ -80,6 +91,154 @@ def doctor() -> None:
     """Check whether this machine is ready to run pi-task."""
     if not run_doctor():
         raise typer.Exit(code=1)
+
+
+def _notify_error(error: NotifyError) -> NoReturn:
+    typer.echo(f"Error: {error}", err=True)
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def notify(
+    show: bool = typer.Option(
+        False,
+        "--show",
+        help="Print the current notify config (token redacted) and exit.",
+    ),
+    url: str | None = typer.Option(
+        None,
+        "--url",
+        help="ntfy base URL (e.g. https://ntfy.example).",
+    ),
+    topic: str | None = typer.Option(None, "--topic", help="ntfy topic name."),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        help="Optional bearer token for the ntfy server.",
+    ),
+    clear_token: bool = typer.Option(
+        False,
+        "--clear-token",
+        help="Remove a stored bearer token.",
+    ),
+    on: str | None = typer.Option(
+        None,
+        "--on",
+        help="Triggers to enable: success, fail, both, or none.",
+    ),
+    send_test: bool | None = typer.Option(
+        None,
+        "--test/--no-test",
+        help="Send a test notification after saving (default: prompt interactively).",
+        show_default=False,
+    ),
+) -> None:
+    """Configure global Run Notifications via ntfy."""
+    try:
+        existing = load_notify_config()
+        if show:
+            if existing is None:
+                typer.echo("Notifications are not configured.")
+                raise typer.Exit()
+            typer.echo(format_config_for_display(existing))
+            raise typer.Exit()
+
+        if token is not None and clear_token:
+            raise NotifyError("provide at most one of --token and --clear-token")
+
+        flagged = (
+            any(value is not None for value in (url, topic, token, on, send_test)) or clear_token
+        )
+        interactive = not flagged
+
+        resolved_url = url
+        resolved_topic = topic
+        resolved_token: str | None
+        if clear_token:
+            resolved_token = None
+        elif token is not None:
+            resolved_token = token
+        else:
+            resolved_token = existing.token if existing is not None else None
+        resolved_on = on
+
+        if interactive:
+            default_topic = existing.topic if existing is not None else ""
+            default_triggers = trigger_choice(existing) if existing is not None else "fail"
+            if existing is not None:
+                resolved_url = typer.prompt(
+                    "ntfy base URL",
+                    default=existing.base_url,
+                ).strip()
+            else:
+                resolved_url = typer.prompt(
+                    "ntfy base URL (e.g. https://ntfy.example)",
+                ).strip()
+            topic_prompt = "ntfy topic"
+            if default_topic:
+                resolved_topic = typer.prompt(topic_prompt, default=default_topic).strip()
+            else:
+                resolved_topic = typer.prompt(topic_prompt).strip()
+            token_hint = "set" if existing is not None and existing.token else "not set"
+            token_entered = typer.prompt(
+                f"Bearer token (optional; currently {token_hint}; empty keeps, '-' clears)",
+                default="",
+                show_default=False,
+            ).strip()
+            if token_entered == "-":
+                resolved_token = None
+            elif token_entered:
+                resolved_token = token_entered
+            resolved_on = typer.prompt(
+                "Notify on (success|fail|both|none)",
+                default=default_triggers,
+            ).strip()
+
+        if resolved_url is None:
+            if existing is None:
+                raise NotifyError("base URL is required")
+            resolved_url = existing.base_url
+        if resolved_topic is None:
+            if existing is None:
+                raise NotifyError("topic is required")
+            resolved_topic = existing.topic
+        if resolved_on is None:
+            if existing is None:
+                on_success, on_fail = parse_trigger_choice("fail")
+            else:
+                on_success, on_fail = existing.on_success, existing.on_fail
+        else:
+            on_success, on_fail = parse_trigger_choice(resolved_on)
+
+        config = save_notify_config(
+            NotifyConfig(
+                base_url=resolved_url,
+                topic=resolved_topic,
+                token=resolved_token,
+                on_success=on_success,
+                on_fail=on_fail,
+            )
+        )
+        typer.echo("Saved notification config:")
+        typer.echo(format_config_for_display(config))
+
+        should_test = send_test
+        if should_test is None:
+            should_test = interactive and typer.confirm("Send test notification?", default=True)
+        if should_test:
+            payload = NotificationPayload(
+                title="pi-task: notify configured",
+                body=(f"Test notification from pi-task.\nTriggers: {trigger_choice(config)}"),
+                tags=("white_check_mark",),
+            )
+            try:
+                publish_notification(config, payload)
+            except NotifyError as error:
+                typer.echo(f"Warning: test notification failed: {error}", err=True)
+            else:
+                typer.echo("Test notification sent.")
+    except NotifyError as error:
+        _notify_error(error)
 
 
 def _required(value: str | None, label: str) -> str:
