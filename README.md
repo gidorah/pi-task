@@ -14,7 +14,7 @@ pi-task is a local command-line tool for recurring and on-demand Pi agent work o
 | Calendar and interval schedules | Per-task time zones |
 | Manual runs, pause/resume, cancel | Scheduler-level automatic retries |
 | Project trust: inherit / approve / deny | Custom permission systems or tool allowlists |
-| Journald operational logs | GUI / TUI, desktop notifications |
+| Journald operational logs; optional ntfy push Notifications | GUI / TUI, desktop notification daemons |
 | Persistent Pi sessions per run | Shared or auto-continued sessions across runs |
 
 Also out of scope: prompt templating, automatic history/session pruning, automatic provider credential management, parallel runs inside one working directory, and recording activations that systemd suppresses before the wrapper starts.
@@ -135,6 +135,8 @@ pi-task logs RUN_ID
 pi-task cancel RUN_ID
 pi-task resume-session daily-review
 pi-task remove daily-review --yes
+pi-task notify
+pi-task notify --show
 ```
 
 ## Create a task
@@ -186,6 +188,7 @@ pi-task does **not** store provider API keys. Use Pi's normal login state, or su
 | `resume` | Schedule only future work. Interval schedules restart their interval from resume time. |
 | `sync` | Regenerate units from definitions; remove generated orphans. |
 | `remove` | End future scheduling; delete the definition and generated units. **Preserves** run history and Pi sessions. |
+| `notify` | Configure global ntfy Notifications for terminal Runs (see below). |
 
 Task definitions live under `$XDG_CONFIG_HOME/pi-task/tasks` (default `~/.config/pi-task/tasks`). Generated units under `$XDG_CONFIG_HOME/systemd/user` are marked as generated — do not edit them by hand; change the TOML and run `sync` or `edit`.
 
@@ -216,11 +219,33 @@ pi-task resume-session daily-review
 
 `resume-session TASK_ID` opens the newest run for that task with `pi --session PATH`, whether the run succeeded or ended unsuccessfully. Active runs cannot be opened interactively. Failed, cancelled, and timed-out sessions remain available once the run is no longer active.
 
+## Notifications (ntfy)
+
+Optional machine-global push Notifications when a Run finishes. Delivery is best-effort and never changes Run status.
+
+```console
+pi-task notify
+pi-task notify --url https://ntfy.example --topic pi-task --on fail --no-test
+pi-task notify --show
+```
+
+| Piece | Behavior |
+| --- | --- |
+| Config | `$XDG_CONFIG_HOME/pi-task/notify.toml` — base URL, topic, optional bearer token, triggers |
+| Triggers | `success` (`succeeded` only), `fail` (any other terminal status), `both`, or `none` (soft off) |
+| Scope | Every terminal Run (`scheduled` and `manual`), including lock-conflict terminals |
+| Title | `{Task name or id}: {Succeeded\|Failed}` |
+| Body | Status, source, duration; error when present |
+| Tags | `white_check_mark` / `x` |
+
+Absent config means no publish attempts. Re-run `notify` to edit; saved values are defaults. After save, the wizard can send a test Notification (skippable; failure warns but keeps the config).
+
 ## Storage and environment
 
 | Location | Content |
 | --- | --- |
 | `$XDG_CONFIG_HOME/pi-task/tasks` | Human-readable task TOML (source of truth) |
+| `$XDG_CONFIG_HOME/pi-task/notify.toml` | Optional global ntfy Notification config |
 | `$XDG_CONFIG_HOME/systemd/user` | Generated `pi-task-*.service` / `.timer` units |
 | `$XDG_STATE_HOME/pi-task/runs.db` | Run and session metadata |
 | `$XDG_RUNTIME_DIR/pi-task/locks` | Same-task and working-directory locks |

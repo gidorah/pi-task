@@ -30,6 +30,7 @@ from pi_task.db import (
 )
 from pi_task.events import StreamObservation, classify_run_status, consume_event_line
 from pi_task.locks import LockConflict, RunLocks, acquire_run_locks, normalize_working_directory
+from pi_task.notify import maybe_notify_run
 from pi_task.tasks import (
     PROCESS_DRAIN_SECONDS,
     PROCESS_KILL_WAIT_SECONDS,
@@ -363,6 +364,7 @@ def _reap_orphaned_runs(prepared: PreparedRun) -> None:
         )
     for orphan_id in abandoned:
         _log(f"run {orphan_id}: abandoned after stale lock recovery")
+        _notify_terminal_run(orphan_id)
 
 
 def heal_orphaned_run(run_id: str) -> bool:
@@ -394,9 +396,11 @@ def heal_orphaned_run(run_id: str) -> bool:
                 task_id=record.task_id,
                 working_directory=normalize_working_directory(directory),
             )
-            return run_id in abandoned
         finally:
             locks.release()
+        for orphan_id in abandoned:
+            _notify_terminal_run(orphan_id)
+        return run_id in abandoned
 
 
 def _require_running_run(run_id: str) -> RunRecord:
@@ -437,7 +441,7 @@ def _force_cancel_terminal(record: RunRecord) -> bool:
         except ValueError:
             duration_ms = 0
         with open_db() as connection:
-            return finish_run(
+            updated = finish_run(
                 connection,
                 record.id,
                 RunCompletion(
@@ -455,6 +459,9 @@ def _force_cancel_terminal(record: RunRecord) -> bool:
                 ),
                 only_if_running=True,
             )
+        if updated:
+            _notify_terminal_run(record.id)
+        return updated
     finally:
         locks.release()
 
@@ -760,7 +767,16 @@ def _record_lock_conflict(prepared: PreparedRun, conflict: LockConflict) -> int:
             ),
         )
     _log(f"run {prepared.run_id}: finished status={status} in {duration_ms}ms")
+    _notify_terminal_run(prepared.run_id)
     return exit_code
+
+
+def _notify_terminal_run(run_id: str) -> None:
+    """Push a Notification for a terminal Run when configured. Best-effort."""
+    with open_db() as connection:
+        record = get_run(connection, run_id)
+    if record is not None:
+        maybe_notify_run(record)
 
 
 def _finalize(
@@ -819,4 +835,5 @@ def _finalize(
         usage_parts.append(f"cost={usage.cost_total}")
     usage_suffix = f" ({', '.join(usage_parts)})" if usage_parts else ""
     _log(f"run {run_id}: finished status={status} in {duration_ms}ms{usage_suffix}")
+    _notify_terminal_run(run_id)
     return 0 if status == "succeeded" else 1

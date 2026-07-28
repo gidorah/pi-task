@@ -23,3 +23,7 @@ _Avoid_: Run history, transcript
 **Pause**:
 A task state that suppresses future scheduled runs without cancelling an active run and without replaying occurrences missed while paused.
 _Avoid_: Disable, stop
+
+**Notification**:
+A push alert about one terminal Run, sent only when that Run's outcome matches the operator's configured triggers.
+_Avoid_: Alert, webhook, message
