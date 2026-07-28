@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from harness import add_task, clear_commands
 
-from pi_task.db import RunRecord
+from pi_task.db import RunRecord, RunSource, RunStatus
 from pi_task.notify import (
     NotifyConfig,
     build_notification,
@@ -151,8 +151,8 @@ def ntfy_server() -> Iterator[tuple[str, list[dict[str, Any]]]]:
 
 def _terminal_record(
     *,
-    status: str = "succeeded",
-    source: str = "scheduled",
+    status: RunStatus = "succeeded",
+    source: RunSource = "scheduled",
     name: str | None = "Daily review",
     error: str | None = None,
     duration_ms: int = 1500,
@@ -175,8 +175,8 @@ def _terminal_record(
     return RunRecord(
         id="run-1",
         task_id="daily-review",
-        source=source,  # type: ignore[arg-type]
-        status=status,  # type: ignore[arg-type]
+        source=source,
+        status=status,
         started_at="2026-01-01T00:00:00.000Z",
         finished_at="2026-01-01T00:00:01.500Z",
         duration_ms=duration_ms,
