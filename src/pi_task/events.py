@@ -6,6 +6,9 @@ from typing import Any, Literal, cast
 
 TerminalRunStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
 
+_UNEXPECTED_LINE_SAMPLE_LIMIT = 3
+_UNEXPECTED_LINE_SAMPLE_LENGTH = 200
+
 
 @dataclass
 class UsageTotals:
@@ -36,8 +39,25 @@ class StreamObservation:
     session_cwd: str | None = None
     final_stop_reason: str | None = None
     saw_assistant: bool = False
-    malformed_line: bool = False
+    unexpected_line_count: int = 0
+    unexpected_line_samples: list[str] = field(default_factory=list)
     usage: UsageTotals = field(default_factory=UsageTotals)
+
+    def observe_unexpected_line(self, text: str) -> None:
+        self.unexpected_line_count += 1
+        if len(self.unexpected_line_samples) < _UNEXPECTED_LINE_SAMPLE_LIMIT:
+            self.unexpected_line_samples.append(text[:_UNEXPECTED_LINE_SAMPLE_LENGTH])
+
+
+def unexpected_output_diagnostic(observation: StreamObservation) -> str | None:
+    if observation.unexpected_line_count == 0:
+        return None
+    count = observation.unexpected_line_count
+    noun = "line" if count == 1 else "lines"
+    samples = ", ".join(
+        json.dumps(sample, ensure_ascii=True) for sample in observation.unexpected_line_samples
+    )
+    return f"unexpected Pi stdout: {count} {noun}; samples: {samples}"
 
 
 def consume_event_line(observation: StreamObservation, line: str) -> None:
@@ -47,10 +67,10 @@ def consume_event_line(observation: StreamObservation, line: str) -> None:
     try:
         event = json.loads(text)
     except json.JSONDecodeError:
-        observation.malformed_line = True
+        observation.observe_unexpected_line(text)
         return
     if not isinstance(event, dict):
-        observation.malformed_line = True
+        observation.observe_unexpected_line(text)
         return
 
     event_type = event.get("type")
@@ -105,8 +125,7 @@ def _observe_assistant(
         return
     observation.saw_assistant = True
     stop_reason = message.get("stopReason")
-    if isinstance(stop_reason, str):
-        observation.final_stop_reason = stop_reason
+    observation.final_stop_reason = stop_reason if isinstance(stop_reason, str) else None
     if count_usage:
         usage = message.get("usage")
         if isinstance(usage, dict):
@@ -129,8 +148,6 @@ def classify_run_status(
     if process_exit_code is None:
         return "failed"
     if process_exit_code != 0:
-        return "failed"
-    if observation.malformed_line:
         return "failed"
     if not observation.saw_assistant or observation.final_stop_reason is None:
         return "failed"

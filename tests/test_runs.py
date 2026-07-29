@@ -139,6 +139,49 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     assert third.returncode == 0, third.stdout + third.stderr
 
 
+def test_successful_run_records_unexpected_pi_stdout_in_journal_output(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "noisy-success")
+    noisy_env = {**run_env, "FAKE_PI_STDOUT_NOISE": "incidental Pi stdout"}
+    _clear_commands(noisy_env)
+
+    executed = run_cli("_run-scheduled", "noisy-success", env=noisy_env)
+
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    assert "unexpected Pi stdout" in executed.stderr
+    assert '"incidental Pi stdout"' in executed.stderr
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute("SELECT status, error FROM runs").fetchone()
+    assert status == "succeeded"
+    assert error is None
+
+
+def test_unexpected_pi_stdout_does_not_mask_failure_error(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "noisy-incomplete")
+    incomplete_env = {
+        **run_env,
+        "FAKE_PI_PARTIAL_SESSION": "1",
+        "FAKE_PI_STDOUT_NOISE": "incidental Pi stdout",
+    }
+    _clear_commands(incomplete_env)
+
+    executed = run_cli("_run-scheduled", "noisy-incomplete", env=incomplete_env)
+
+    assert executed.returncode != 0
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        status, error = connection.execute("SELECT status, error FROM runs").fetchone()
+    assert status == "failed"
+    assert error == "missing final assistant response"
+    assert "unexpected Pi stdout" in executed.stderr
+
+
 def test_resume_session_opens_recorded_pi_session(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
