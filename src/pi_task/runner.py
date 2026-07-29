@@ -28,7 +28,12 @@ from pi_task.db import (
     insert_run,
     open_db,
 )
-from pi_task.events import StreamObservation, classify_run_status, consume_event_line
+from pi_task.events import (
+    StreamObservation,
+    classify_run_status,
+    consume_event_line,
+    unexpected_output_diagnostic,
+)
 from pi_task.locks import LockConflict, RunLocks, acquire_run_locks, normalize_working_directory
 from pi_task.notify import maybe_notify_run
 from pi_task.tasks import (
@@ -255,12 +260,12 @@ def _error_for_status(
         return error
     if observation.final_stop_reason and observation.final_stop_reason != "stop":
         return f"final stop reason: {observation.final_stop_reason}"
-    if observation.malformed_line:
-        return "malformed Pi JSON event stream"
-    if not observation.saw_assistant:
-        return "missing final assistant response"
     if exit_code not in (0, None):
         return f"Pi exited with status {exit_code}"
+    if not observation.saw_assistant:
+        return "missing final assistant response"
+    if diagnostic := unexpected_output_diagnostic(observation):
+        return diagnostic
     return f"run ended with status {status}"
 
 
@@ -637,6 +642,8 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
             exit_code = process.returncode
             for line in (stdout or "").splitlines():
                 consume_event_line(observation, line)
+            if diagnostic := unexpected_output_diagnostic(observation):
+                _log(f"run {run_id}: {diagnostic}")
             # Keep Pi diagnostics brief; never forward the JSON event stream.
             if (stderr or "").strip():
                 for line in stderr.splitlines():

@@ -72,6 +72,8 @@ if name == "pi":
     session_path.write_text(session_body)
     print(json.dumps(header), flush=True)
     print(json.dumps({"type": "agent_start"}), flush=True)
+    if noise := os.environ.get("FAKE_PI_STDOUT_NOISE"):
+        print(noise, flush=True)
     if not partial_only:
         print(json.dumps({"type": "message_end", "message": assistant}), flush=True)
         print(json.dumps({"type": "agent_end", "messages": [assistant]}), flush=True)

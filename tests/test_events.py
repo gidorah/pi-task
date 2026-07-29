@@ -145,6 +145,38 @@ def test_length_exhaustion_and_missing_response_fail() -> None:
     )
 
 
+def test_final_assistant_without_stop_reason_fails() -> None:
+    observation = StreamObservation()
+    consume_event_line(
+        observation,
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"},
+            }
+        ),
+    )
+    consume_event_line(
+        observation,
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant"},
+            }
+        ),
+    )
+
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=observation,
+        )
+        == "failed"
+    )
+
+
 def test_unresolved_terminal_tool_use_fails() -> None:
     observation = StreamObservation()
     consume_event_line(
@@ -164,6 +196,39 @@ def test_unresolved_terminal_tool_use_fails() -> None:
             observation=observation,
         )
         == "failed"
+    )
+
+
+def test_unexpected_output_diagnostics_are_bounded() -> None:
+    observation = StreamObservation()
+    for line in ["first", "second", "x" * 500, "fourth", "fifth"]:
+        consume_event_line(observation, line)
+
+    assert observation.unexpected_line_count == 5
+    assert observation.unexpected_line_samples == ["first", "second", "x" * 200]
+
+
+def test_successful_completion_ignores_incidental_non_event_output() -> None:
+    observation = StreamObservation()
+    consume_event_line(observation, "incidental diagnostic")
+    consume_event_line(
+        observation,
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"},
+            }
+        ),
+    )
+
+    assert (
+        classify_run_status(
+            process_exit_code=0,
+            timed_out=False,
+            cancelled=False,
+            observation=observation,
+        )
+        == "succeeded"
     )
 
 
