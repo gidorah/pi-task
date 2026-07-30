@@ -710,9 +710,7 @@ def run_task(
     except TaskError as error:
         _task_error(error)
         raise
-    typer.echo(
-        f"Started manual run {submission.run_id} for task {task_id} in the background."
-    )
+    typer.echo(f"Started manual run {submission.run_id} for task {task_id} in the background.")
 
 
 @app.command()
