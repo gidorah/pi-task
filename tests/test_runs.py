@@ -279,17 +279,15 @@ def test_scheduled_entrypoint_rejects_unknown_source(
     assert "source" in result.stderr.lower()
 
 
-def test_run_waits_records_manual_source_and_reports_status(
+def test_run_starts_manual_run_in_background(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    _add_task(run_cli, run_env, "manual-wait")
+    _add_task(run_cli, run_env, "manual-background")
     _clear_commands(run_env)
 
-    executed = run_cli("run", "manual-wait", env=run_env)
+    executed = run_cli("run", "manual-background", env=run_env)
     assert executed.returncode == 0, executed.stdout + executed.stderr
-    assert "succeeded" in executed.stdout
-    assert "manual-wait" in executed.stdout
 
     commands = _commands(run_env)
     systemd_run = [command for command in commands if command[0] == "systemd-run"]
@@ -297,18 +295,22 @@ def test_run_waits_records_manual_source_and_reports_status(
     invocation = systemd_run[0]
     assert "--user" in invocation
     assert "--collect" in invocation
-    assert "--wait" in invocation
+    assert "--wait" not in invocation
     unit_args = [arg for arg in invocation if arg.startswith("--unit=")]
     assert len(unit_args) == 1
-    assert unit_args[0].startswith("--unit=pi-task-run-manual-wait-")
+    assert unit_args[0].startswith("--unit=pi-task-run-manual-background-")
     # Full UUID hex suffix (32 chars) keeps unit names unique without hyphens.
-    assert len(unit_args[0].removeprefix("--unit=pi-task-run-manual-wait-")) == 32
+    assert len(unit_args[0].removeprefix("--unit=pi-task-run-manual-background-")) == 32
     assert "--property=RuntimeMaxSec=1320" in invocation
     assert "--property=TimeoutStopSec=30" in invocation
     assert "_run-scheduled" in invocation
-    assert "manual-wait" in invocation
+    assert "manual-background" in invocation
     source_index = invocation.index("--source")
     assert invocation[source_index + 1] == "manual"
+    run_id = invocation[invocation.index("--run-id") + 1]
+    assert executed.stdout == (
+        f"Started manual run {run_id} for task manual-background in the background.\n"
+    )
 
     systemctl = [command for command in commands if command[0] == "systemctl"]
     timer_mutations = [
@@ -319,50 +321,40 @@ def test_run_waits_records_manual_source_and_reports_status(
     ]
     assert timer_mutations == []
 
-    listed = run_cli("runs", "manual-wait", env=run_env)
+    listed = run_cli("runs", "manual-background", env=run_env)
     assert listed.returncode == 0, listed.stdout + listed.stderr
-    assert "manual" in listed.stdout
-    assert "succeeded" in listed.stdout
-
-    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
-    with sqlite3.connect(db_path) as connection:
-        source, status, session_path = connection.execute(
-            "SELECT source, status, session_path FROM runs"
-        ).fetchone()
-    assert source == "manual"
-    assert status == "succeeded"
-    assert session_path is not None and Path(session_path).is_file()
-
-    unit_dir = Path(run_env["XDG_CONFIG_HOME"]) / "systemd" / "user"
-    transient_units = list(unit_dir.glob("pi-task-run-*"))
-    assert transient_units == []
+    assert "No runs recorded" in listed.stdout
 
 
-def test_run_detach_submits_without_waiting(
+def test_run_rejects_removed_detach_option(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    _add_task(run_cli, run_env, "manual-detach")
-    _clear_commands(run_env)
+    _add_task(run_cli, run_env, "manual-background")
 
-    executed = run_cli("run", "manual-detach", "--detach", env=run_env)
-    assert executed.returncode == 0, executed.stdout + executed.stderr
-    assert "submitted" in executed.stdout.lower() or "started" in executed.stdout.lower()
+    executed = run_cli("run", "manual-background", "--detach", env=run_env)
 
-    commands = _commands(run_env)
-    systemd_run = [command for command in commands if command[0] == "systemd-run"]
-    assert len(systemd_run) == 1
-    invocation = systemd_run[0]
-    assert "--wait" not in invocation
-    assert "--collect" in invocation
-    assert "--user" in invocation
-    source_index = invocation.index("--source")
-    assert invocation[source_index + 1] == "manual"
+    assert executed.returncode != 0
+    assert "detach" in executed.stderr.lower()
 
-    # Detached submission does not run the wrapper in the fake manager, so no DB row yet.
-    listed = run_cli("runs", "manual-detach", env=run_env)
-    assert listed.returncode == 0, listed.stdout + listed.stderr
-    assert "No runs recorded" in listed.stdout or "manual" not in listed.stdout
+
+def test_run_reports_submission_failure_without_claiming_started(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    _add_task(run_cli, run_env, "manual-rejected")
+    failed_env = {
+        **run_env,
+        "FAKE_SYSTEMD_RUN_EXIT": "23",
+        "FAKE_SYSTEMD_RUN_STDERR": "manager rejected request",
+    }
+
+    executed = run_cli("run", "manual-rejected", env=failed_env)
+
+    assert executed.returncode != 0
+    assert "could not submit manual run" in executed.stderr
+    assert "manager rejected request" in executed.stderr
+    assert "Started manual run" not in executed.stdout
 
 
 def test_run_unknown_task_fails_without_starting_service(

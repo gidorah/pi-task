@@ -144,6 +144,11 @@ if name == "systemd-run":
     import subprocess
 
     args = sys.argv[1:]
+    exit_code = int(os.environ.get("FAKE_SYSTEMD_RUN_EXIT", "0"))
+    if exit_code:
+        if error := os.environ.get("FAKE_SYSTEMD_RUN_STDERR"):
+            print(error, file=sys.stderr)
+        raise SystemExit(exit_code)
     wait = "--wait" in args
     command: list[str] = []
     for index, arg in enumerate(args):

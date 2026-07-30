@@ -128,7 +128,6 @@ pi-task pause daily-review
 pi-task resume daily-review
 pi-task sync
 pi-task run daily-review
-pi-task run daily-review --detach
 pi-task runs
 pi-task runs daily-review
 pi-task logs RUN_ID
@@ -200,7 +199,7 @@ When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID -
 | --- | --- |
 | Overlap | Same task cannot overlap; tasks sharing a normalized working directory are serialized; different directories may run concurrently. |
 | Scheduled lock conflict | Recorded as `skipped` when the wrapper starts. Activations systemd suppresses before the wrapper starts are not recorded. |
-| Manual run | `pi-task run TASK_ID` starts a uniquely named transient user service (`--collect`). Waiting is default; `--detach` returns after submission. **Never** starts, stops, or modifies the recurring timer. |
+| Manual run | `pi-task run TASK_ID` starts a uniquely named transient user service (`--collect`) and returns immediately with its Run ID. Inspect the eventual result with `pi-task runs TASK_ID` or `pi-task logs RUN_ID`. **Never** starts, stops, or modifies the recurring timer. |
 | Timeout | Wrapper records `timed_out`. Units also set `RuntimeMaxSec` slightly above the task timeout as a hung-wrapper backstop. After upgrades, run `pi-task sync`. |
 | Cancel | `pi-task cancel RUN_ID` stops the supervising unit. Distinct from pause. Status `cancelled`; partial sessions remain. |
 | Success | Normal Pi process exit with a final assistant stop reason indicating completion. Recovered tool errors do not override final success. |

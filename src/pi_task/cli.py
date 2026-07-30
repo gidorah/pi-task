@@ -703,38 +703,16 @@ def sync() -> None:
 @app.command("run")
 def run_task(
     task_id: str = typer.Argument(..., help="Task ID to run immediately."),
-    detach: bool = typer.Option(
-        False,
-        "--detach",
-        help="Return after submitting the transient service without waiting.",
-    ),
 ) -> None:
-    """Run a task once via a transient systemd user service without touching its timer."""
+    """Start a task once in the background without touching its timer."""
     try:
-        submission = start_manual_run(task_id, detach=detach)
+        submission = start_manual_run(task_id)
     except TaskError as error:
         _task_error(error)
         raise
-    if detach:
-        typer.echo(
-            f"Submitted manual run {submission.run_id} for task {task_id} (unit {submission.unit})."
-        )
-        raise typer.Exit()
-    try:
-        with open_db() as connection:
-            record = get_run(connection, submission.run_id)
-    except TaskError as error:
-        _task_error(error)
-        raise
-    if record is None:
-        detail = submission.service_detail or (
-            f"manual run {submission.run_id} produced no history "
-            f"(service exit {submission.service_exit_code})"
-        )
-        typer.echo(f"Error: {detail}", err=True)
-        raise typer.Exit(code=1)
-    _echo_run_summary(record)
-    raise typer.Exit(code=0 if record.status == "succeeded" else 1)
+    typer.echo(
+        f"Started manual run {submission.run_id} for task {task_id} in the background."
+    )
 
 
 @app.command()

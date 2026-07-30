@@ -443,9 +443,6 @@ class ManualRunSubmission:
 
     run_id: str
     unit: str
-    detach: bool
-    service_exit_code: int | None
-    service_detail: str | None = None
 
 
 def manual_unit_name(task_id: str, run_id: str) -> str:
@@ -489,12 +486,12 @@ def _systemd_run_detail(result: subprocess.CompletedProcess[str]) -> str | None:
     return None
 
 
-def start_manual_run(task_id: str, *, detach: bool = False) -> ManualRunSubmission:
+def start_manual_run(task_id: str) -> ManualRunSubmission:
     """Start a uniquely named transient user service that runs the task once.
 
     The recurring timer is never started, stopped, enabled, disabled, or restarted.
-    The wrapper enforces the task timeout; this call does not add a second timeout
-    around systemd-run --wait so a finished run can still be reported from history.
+    The wrapper enforces the task timeout; this call returns after systemd accepts the
+    transient service and does not wait for the Run to finish.
     """
     task = get_task(task_id)
     run_id = str(uuid.uuid4())
@@ -512,20 +509,14 @@ def start_manual_run(task_id: str, *, detach: bool = False) -> ManualRunSubmissi
         f"--property=TimeoutStopSec={TIMEOUT_STOP_SECONDS}",
         f"--description=Manual pi-task run {task.task_id}",
         f"--working-directory={task.working_directory}",
+        pi_task,
+        "_run-scheduled",
+        task.task_id,
+        "--source",
+        "manual",
+        "--run-id",
+        run_id,
     ]
-    if not detach:
-        command.append("--wait")
-    command.extend(
-        [
-            pi_task,
-            "_run-scheduled",
-            task.task_id,
-            "--source",
-            "manual",
-            "--run-id",
-            run_id,
-        ]
-    )
 
     try:
         result = subprocess.run(
@@ -536,28 +527,12 @@ def start_manual_run(task_id: str, *, detach: bool = False) -> ManualRunSubmissi
             env={**os.environ, "LC_ALL": "C"},
         )
     except OSError as error:
-        raise TaskError(f"could not start manual run: {error}") from error
+        raise TaskError(f"could not submit manual run: {error}") from error
 
-    detail = _systemd_run_detail(result)
-    if detach:
-        if result.returncode != 0:
-            raise TaskError(f"could not submit manual run: {detail}")
-        return ManualRunSubmission(
-            run_id=run_id,
-            unit=unit,
-            detach=True,
-            service_exit_code=None,
-        )
-
-    # With --wait, a non-zero exit may mean submission failure or a failed run.
-    # The caller inspects the run record when the wrapper managed to start.
-    return ManualRunSubmission(
-        run_id=run_id,
-        unit=unit,
-        detach=False,
-        service_exit_code=result.returncode,
-        service_detail=detail if result.returncode != 0 else None,
-    )
+    if result.returncode != 0:
+        detail = _systemd_run_detail(result)
+        raise TaskError(f"could not submit manual run: {detail}")
+    return ManualRunSubmission(run_id=run_id, unit=unit)
 
 
 def stop_user_unit(unit: str, *, timeout: float = SYSTEMCTL_STOP_TIMEOUT_SECONDS) -> None:

@@ -84,7 +84,7 @@ def test_logs_selects_manual_unit_by_invocation(
     }
     add_task(run_env, "manual-logs", cli=run_cli)
     clear_commands(run_env)
-    ran = run_cli("run", "manual-logs", env=run_env)
+    ran = run_cli("_run-scheduled", "manual-logs", "--source", "manual", env=run_env)
     assert ran.returncode == 0, ran.stdout + ran.stderr
 
     db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
