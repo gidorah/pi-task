@@ -367,7 +367,15 @@ def test_manual_overlap_fails_clearly(
 
     first = _start_gated_run(lock_env, "manual-block")
     try:
-        blocked = run_cli("run", "manual-block", env=_immediate_env(lock_env, "manual"))
+        blocked = run_cli(
+            "_run-scheduled",
+            "manual-block",
+            "--source",
+            "manual",
+            "--run-id",
+            "manual-block-second",
+            env=_immediate_env(lock_env, "manual"),
+        )
         assert blocked.returncode != 0, blocked.stdout + blocked.stderr
         combined = (blocked.stdout + blocked.stderr).lower()
         assert (
