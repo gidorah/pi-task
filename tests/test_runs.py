@@ -296,6 +296,7 @@ def test_run_starts_manual_run_in_background(
     assert "--user" in invocation
     assert "--collect" in invocation
     assert "--wait" not in invocation
+    assert "--no-block" in invocation
     unit_args = [arg for arg in invocation if arg.startswith("--unit=")]
     assert len(unit_args) == 1
     assert unit_args[0].startswith("--unit=pi-task-run-manual-background-")

@@ -502,6 +502,7 @@ def start_manual_run(task_id: str) -> ManualRunSubmission:
     command = [
         systemd_run,
         "--user",
+        "--no-block",
         f"--unit={unit}",
         "--collect",
         "--property=Type=oneshot",

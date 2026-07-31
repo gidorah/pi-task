@@ -150,6 +150,8 @@ if name == "systemd-run":
             print(error, file=sys.stderr)
         raise SystemExit(exit_code)
     wait = "--wait" in args
+    no_block = "--no-block" in args
+    oneshot = "--property=Type=oneshot" in args
     command: list[str] = []
     for index, arg in enumerate(args):
         if arg == "--":
@@ -158,7 +160,8 @@ if name == "systemd-run":
         if not arg.startswith("-"):
             command = args[index:]
             break
-    if wait and command:
+    # systemd-run waits for a oneshot start job unless --no-block is set.
+    if (wait or (oneshot and not no_block)) and command:
         raise SystemExit(subprocess.call(command))
     raise SystemExit(0)
 if name == "journalctl":
