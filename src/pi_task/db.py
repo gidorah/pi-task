@@ -291,17 +291,21 @@ def list_runs(
     *,
     task_id: str | None = None,
     limit: int = 50,
+    oldest_first: bool = False,
 ) -> list[RunRecord]:
-    if task_id is None:
-        rows = connection.execute(
-            "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    """List up to ``limit`` runs, optionally displaying them chronologically."""
+    where = " WHERE task_id = ?" if task_id is not None else ""
+    params: tuple[str | int, ...] = (task_id, limit) if task_id is not None else (limit,)
+    if oldest_first:
+        query = (
+            "SELECT * FROM ("
+            f"SELECT * FROM runs{where} "
+            "ORDER BY started_at DESC, id DESC LIMIT ?"
+            ") ORDER BY started_at ASC, id ASC"
+        )
     else:
-        rows = connection.execute(
-            "SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC LIMIT ?",
-            (task_id, limit),
-        ).fetchall()
+        query = f"SELECT * FROM runs{where} ORDER BY started_at DESC, id DESC LIMIT ?"
+    rows = connection.execute(query, params).fetchall()
     return [_row_to_run(row) for row in rows]
 
 

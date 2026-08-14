@@ -139,6 +139,66 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     assert third.returncode == 0, third.stdout + third.stderr
 
 
+def test_runs_lists_latest_runs_oldest_first(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    initialized = run_cli("runs", env=run_env)
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO runs (
+                id, task_id, source, status, started_at, prompt_hash, snapshot_json,
+                model, thinking
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "oldest-run",
+                    "history",
+                    "manual",
+                    "succeeded",
+                    "2024-01-01T00:00:00.000Z",
+                    "old-hash",
+                    "{}",
+                    "acme/rocket",
+                    "high",
+                ),
+                (
+                    "middle-run",
+                    "history",
+                    "manual",
+                    "succeeded",
+                    "2024-01-02T00:00:00.000Z",
+                    "middle-hash",
+                    "{}",
+                    "acme/rocket",
+                    "high",
+                ),
+                (
+                    "newest-run",
+                    "history",
+                    "manual",
+                    "succeeded",
+                    "2024-01-03T00:00:00.000Z",
+                    "new-hash",
+                    "{}",
+                    "acme/rocket",
+                    "high",
+                ),
+            ],
+        )
+
+    for arguments in (("runs", "--limit", "2"), ("runs", "history", "--limit", "2")):
+        listed = run_cli(*arguments, env=run_env)
+        assert listed.returncode == 0, listed.stdout + listed.stderr
+        assert "Run: oldest-run" not in listed.stdout
+        assert listed.stdout.index("Run: middle-run") < listed.stdout.index("Run: newest-run")
+
+
 def test_successful_run_records_unexpected_pi_stdout_in_journal_output(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
