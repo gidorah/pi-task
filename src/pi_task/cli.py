@@ -774,7 +774,12 @@ def runs(
     """List recorded runs and their Pi session information."""
     try:
         with open_db() as connection:
-            records = list_runs(connection, task_id=task_id, limit=limit)
+            records = list_runs(
+                connection,
+                task_id=task_id,
+                limit=limit,
+                oldest_first=True,
+            )
     except TaskError as error:
         _task_error(error)
     if not records:
