@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 TerminalRunStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
+ResultOutcome = Literal["succeeded", "partial", "blocked", "failed", "unknown"]
+
+_RESULT_BLOCK = re.compile(
+    r"<pi-task-result>\s*(?P<payload>\{.*?\})\s*</pi-task-result>\s*\Z",
+    re.DOTALL,
+)
+_RESULT_OUTCOMES = {"succeeded", "partial", "blocked", "failed", "unknown"}
 
 _UNEXPECTED_LINE_SAMPLE_LIMIT = 3
 _UNEXPECTED_LINE_SAMPLE_LENGTH = 200
@@ -39,6 +47,7 @@ class StreamObservation:
     session_cwd: str | None = None
     final_stop_reason: str | None = None
     saw_assistant: bool = False
+    final_assistant_text: str | None = None
     unexpected_line_count: int = 0
     unexpected_line_samples: list[str] = field(default_factory=list)
     usage: UsageTotals = field(default_factory=UsageTotals)
@@ -127,9 +136,51 @@ def _observe_assistant(
     stop_reason = message.get("stopReason")
     observation.final_stop_reason = stop_reason if isinstance(stop_reason, str) else None
     if count_usage:
+        observation.final_assistant_text = _message_text(message)
         usage = message.get("usage")
         if isinstance(usage, dict):
             observation.usage.add_message_usage(usage)
+
+
+def _message_text(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts = [
+        item["text"]
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+    ]
+    return "".join(parts) if parts else None
+
+
+def parse_result_report(text: str | None) -> tuple[ResultOutcome, str] | None:
+    """Parse one structured result block anchored at the final response's end."""
+    if text is None or text.count("<pi-task-result>") != 1:
+        return None
+    match = _RESULT_BLOCK.search(text)
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group("payload"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"outcome", "summary"}:
+        return None
+    outcome = payload["outcome"]
+    summary = payload["summary"]
+    if (
+        not isinstance(outcome, str)
+        or outcome not in _RESULT_OUTCOMES
+        or not isinstance(summary, str)
+        or not summary.strip()
+    ):
+        return None
+    return cast("ResultOutcome", outcome), summary.strip()
 
 
 def classify_run_status(

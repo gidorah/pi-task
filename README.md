@@ -146,12 +146,22 @@ Every task needs:
 | --- | --- |
 | **Task ID** | Immutable lowercase slug (`daily-review`). Used in units, locks, and filenames. |
 | **Working directory** | Explicit project path; Pi runs there. |
-| **Prompt** | Exactly one of `--prompt` or `--prompt-file`. Submitted exactly as stored (no templating). |
+| **Prompt** | Exactly one of `--prompt` or `--prompt-file`. No templating. `--result-reporting` appends the result contract described below. |
 | **Schedule** | Exactly one of `--calendar` or `--interval`. |
 | **Model** | Available `provider/model` as seen by the systemd user-manager environment. |
 | **Thinking level** | Pi thinking level (`off` … `max`). Default `medium`. |
 | **Timeout** | Default `30m`. Wrapper enforces it; systemd has a slightly longer hard backstop. |
 | **Trust** | `inherit` (default), `approve`, or `deny`. |
+
+Structured Result reporting is opt-in per Task:
+
+```console
+pi-task add daily-review ... --result-reporting
+pi-task edit daily-review --result-reporting
+pi-task edit daily-review --no-result-reporting
+```
+
+When enabled, pi-task asks Pi to end its final response with a small JSON Result containing an `outcome` and `summary`. Outcomes are `succeeded`, `partial`, `blocked`, `failed`, or `unknown`. A missing or malformed Result becomes `unknown`. This is the agent's own assessment, not independent verification.
 
 Optional: `--name` for a human-readable label, `--catch-up` / `--no-catch-up` for calendar persistence, `--paused` to create without activating the timer, `--yes` to skip confirmation.
 
@@ -193,7 +203,7 @@ Task definitions live under `$XDG_CONFIG_HOME/pi-task/tasks` (default `~/.config
 
 ## Runs: scheduled, manual, cancel, history
 
-When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, takes exclusive same-task and same-working-directory locks under `$XDG_RUNTIME_DIR/pi-task/locks`, hashes the resolved prompt, invokes Pi once in `--mode json`, and records the run plus session path in `$XDG_STATE_HOME/pi-task/runs.db`.
+When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID --source scheduled`. The wrapper snapshots the task, takes exclusive same-task and same-working-directory locks under `$XDG_RUNTIME_DIR/pi-task/locks`, hashes the resolved user prompt, invokes Pi once in `--mode json`, and records the Run plus session path in `$XDG_STATE_HOME/pi-task/runs.db`. For Tasks with Result reporting enabled, it appends a short reporting contract before invoking Pi.
 
 | Concern | Behavior |
 | --- | --- |
@@ -202,7 +212,7 @@ When a timer fires, the generated service runs `pi-task _run-scheduled TASK_ID -
 | Manual run | `pi-task run TASK_ID` starts a uniquely named transient user service (`--collect`) and returns immediately with its Run ID. Inspect the eventual result with `pi-task runs TASK_ID` or `pi-task logs RUN_ID`. **Never** starts, stops, or modifies the recurring timer. |
 | Timeout | Wrapper records `timed_out`. Units also set `RuntimeMaxSec` slightly above the task timeout as a hung-wrapper backstop. After upgrades, run `pi-task sync`. |
 | Cancel | `pi-task cancel RUN_ID` stops the supervising unit. Distinct from pause. Status `cancelled`; partial sessions remain. |
-| Success | Normal Pi process exit with a final assistant stop reason indicating completion. Recovered tool errors do not override final success. |
+| Run success | Normal Pi process exit with a final assistant stop reason indicating completion. Recovered tool errors do not override operational success. A reported partial, blocked, failed, or unknown Result does not change the wrapper exit code. |
 | Retries | pi-task does not automatically replay failed prompts. |
 
 ```console
@@ -212,7 +222,7 @@ pi-task logs RUN_ID
 pi-task resume-session daily-review
 ```
 
-`runs` shows source, status (`succeeded` / `failed` / `skipped` / `cancelled` / `timed_out`), start time, duration, model, thinking, prompt hash, tokens, cost when available, session id/path, and supervising unit / invocation when known.
+`runs` shows source, status (`succeeded` / `failed` / `skipped` / `cancelled` / `timed_out`), optional Result and summary, start time, duration, model, thinking, prompt hash, tokens, cost when available, session id/path, and supervising unit / invocation when known.
 
 `logs RUN_ID` reads journald for that run. With a stored `INVOCATION_ID`, selection is exact; otherwise it falls back to unit name plus a tight time window. Missing or expired journal lines are explained without changing SQLite history. Concise lifecycle lines go to the journal; the full Pi JSON stream does not — the Pi session remains the canonical detailed history.
 
@@ -224,17 +234,19 @@ Optional machine-global push Notifications when a Run finishes. Delivery is best
 
 ```console
 pi-task notify
-pi-task notify --url https://ntfy.example --topic pi-task --on fail --no-test
+pi-task notify --url https://ntfy.example --topic pi-task --on attention --no-test
 pi-task notify --show
 ```
 
 | Piece | Behavior |
 | --- | --- |
 | Config | `$XDG_CONFIG_HOME/pi-task/notify.toml` — base URL, topic, optional bearer token, triggers |
-| Triggers | `success` (`succeeded` only), `fail` (any other terminal status), `both`, or `none` (soft off) |
+| Triggers | `success`, `attention`, `both`, or `none` (soft off). `fail` remains an alias for `attention`. |
 | Scope | Every terminal Run (`scheduled` and `manual`), including lock-conflict terminals |
-| Title | `{Task name or id}: {Succeeded\|Failed}` |
-| Body | Status, source, duration; error when present |
+| Success | Operationally successful Run with reporting disabled, or a `succeeded` Result |
+| Attention | Any operational non-success, or a `partial`, `blocked`, `failed`, or `unknown` Result |
+| Title | `Completed` without reporting; semantic Result title when reported; otherwise the operational status |
+| Body | Status, source, duration, bounded Result summary, and error when present |
 | Tags | `white_check_mark` / `x` |
 
 Absent config means no publish attempts. Re-run `notify` to edit; saved values are defaults. After save, the wizard can send a test Notification (skippable; failure warns but keeps the config).

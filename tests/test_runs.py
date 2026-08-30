@@ -139,6 +139,67 @@ def test_scheduled_run_records_succeeded_session_and_lists_it(
     assert third.returncode == 0, third.stdout + third.stderr
 
 
+def test_structured_result_contract_is_opt_in_and_result_is_persisted(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    add_task(run_env, "plain", cli=run_cli)
+    add_task(run_env, "reported", result_reporting=True, cli=run_cli)
+    _clear_commands(run_env)
+    result_text = (
+        "Changed the config.\n<pi-task-result>\n"
+        '{"outcome":"partial","summary":"Changed config; restart remains."}\n'
+        "</pi-task-result>"
+    )
+    result_env = {**run_env, "FAKE_ASSISTANT_TEXT": result_text}
+
+    plain = run_cli("_run-scheduled", "plain", env=result_env)
+    reported = run_cli("_run-scheduled", "reported", env=result_env)
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+    assert reported.returncode == 0, reported.stdout + reported.stderr
+
+    pi_commands = [command for command in _commands(run_env) if command[0] == "pi"]
+    plain_prompt, reported_prompt = pi_commands[0][-1], pi_commands[1][-1]
+    assert plain_prompt == "Inspect the project."
+    assert reported_prompt.startswith("Inspect the project.\n\n")
+    assert "<pi-task-result>" in reported_prompt
+    assert '"outcome":"succeeded"' in reported_prompt
+    assert "partial when meaningful requested\nwork is done" in reported_prompt
+    assert "blocked when no meaningful requested work\nis done" in reported_prompt
+    assert "failed when no meaningful\nrequested work is done" in reported_prompt
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT task_id, result_outcome, result_summary FROM runs ORDER BY task_id"
+        ).fetchall()
+    assert rows == [
+        ("plain", None, None),
+        ("reported", "partial", "Changed config; restart remains."),
+    ]
+
+    listed = run_cli("runs", "reported", env=run_env)
+    assert "Result: partial" in listed.stdout
+    assert "Result summary: Changed config; restart remains." in listed.stdout
+
+
+def test_missing_structured_result_is_recorded_as_unknown(
+    run_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    add_task(run_env, "unreported", result_reporting=True, cli=run_cli)
+    executed = run_cli("_run-scheduled", "unreported", env=run_env)
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    assert "usable result" in executed.stderr
+
+    db_path = Path(run_env["XDG_STATE_HOME"]) / "pi-task" / "runs.db"
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT status, result_outcome, result_summary FROM runs"
+        ).fetchone()
+    assert row == ("succeeded", "unknown", "Agent did not provide a usable result.")
+
+
 def test_runs_lists_latest_runs_oldest_first(
     run_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],

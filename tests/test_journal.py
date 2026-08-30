@@ -36,6 +36,8 @@ def _record(**overrides: object) -> RunRecord:
         "error": None,
         "unit_name": "pi-task-daily-review.service",
         "invocation_id": None,
+        "result_outcome": None,
+        "result_summary": None,
     }
     base.update(overrides)
     return RunRecord(**base)  # type: ignore[arg-type]
@@ -90,7 +92,7 @@ def test_missing_journal_message_mentions_sqlite_unchanged() -> None:
     assert journal_selection_label(record) in message
 
 
-def test_migrate_v1_to_v2_adds_columns_and_is_idempotent(tmp_path: Path) -> None:
+def test_migrate_v1_to_latest_adds_columns_and_is_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "runs.db"
     # Hand-build a v1 database without unit/invocation columns.
     connection = sqlite3.connect(db_path)
@@ -141,8 +143,10 @@ def test_migrate_v1_to_v2_adds_columns_and_is_idempotent(tmp_path: Path) -> None
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(runs)").fetchall()}
         assert "unit_name" in columns
         assert "invocation_id" in columns
+        assert "result_outcome" in columns
+        assert "result_summary" in columns
         version = migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        assert version == 2
+        assert version == 3
         row = migrated.execute(
             "SELECT id, unit_name, invocation_id, prompt_hash FROM runs WHERE id = 'r1'"
         ).fetchone()
@@ -154,7 +158,7 @@ def test_migrate_v1_to_v2_adds_columns_and_is_idempotent(tmp_path: Path) -> None
     # Re-open is a no-op even if columns already exist (partial-apply recovery).
     with open_db(db_path) as again:
         version = again.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        assert version == 2
+        assert version == 3
 
 
 def test_migrate_recovers_when_columns_exist_without_version_row(tmp_path: Path) -> None:
@@ -198,4 +202,6 @@ def test_migrate_recovers_when_columns_exist_without_version_row(tmp_path: Path)
 
     with open_db(db_path) as migrated:
         version = migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        assert version == 2
+        columns = {row[1] for row in migrated.execute("PRAGMA table_info(runs)").fetchall()}
+        assert {"result_outcome", "result_summary"} <= columns
+        assert version == 3

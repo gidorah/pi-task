@@ -124,7 +124,7 @@ def notify(
     on: str | None = typer.Option(
         None,
         "--on",
-        help="Triggers to enable: success, fail, both, or none.",
+        help="Triggers to enable: success, attention, both, or none (fail is an alias).",
     ),
     send_test: bool | None = typer.Option(
         None,
@@ -164,7 +164,7 @@ def notify(
 
         if interactive:
             default_topic = existing.topic if existing is not None else ""
-            default_triggers = trigger_choice(existing) if existing is not None else "fail"
+            default_triggers = trigger_choice(existing) if existing is not None else "attention"
             if existing is not None:
                 resolved_url = typer.prompt(
                     "ntfy base URL",
@@ -190,7 +190,7 @@ def notify(
             elif token_entered:
                 resolved_token = token_entered
             resolved_on = typer.prompt(
-                "Notify on (success|fail|both|none)",
+                "Notify on (success|attention|both|none)",
                 default=default_triggers,
             ).strip()
 
@@ -204,11 +204,11 @@ def notify(
             resolved_topic = existing.topic
         if resolved_on is None:
             if existing is None:
-                on_success, on_fail = parse_trigger_choice("fail")
+                on_success, on_attention = parse_trigger_choice("attention")
             else:
-                on_success, on_fail = existing.on_success, existing.on_fail
+                on_success, on_attention = existing.on_success, existing.on_attention
         else:
-            on_success, on_fail = parse_trigger_choice(resolved_on)
+            on_success, on_attention = parse_trigger_choice(resolved_on)
 
         config = save_notify_config(
             NotifyConfig(
@@ -216,7 +216,7 @@ def notify(
                 topic=resolved_topic,
                 token=resolved_token,
                 on_success=on_success,
-                on_fail=on_fail,
+                on_attention=on_attention,
             )
         )
         typer.echo("Saved notification config:")
@@ -284,6 +284,8 @@ def _echo_run_summary(record: RunRecord, *, verbose: bool = False) -> None:
                 ("Session path", record.session_path, True),
                 ("Unit", record.unit_name, False),
                 ("Invocation", record.invocation_id, False),
+                ("Result", record.result_outcome, False),
+                ("Result summary", record.result_summary, False),
                 ("Error", record.error, False),
             ]
         )
@@ -440,6 +442,11 @@ def add(
         help=f"Project trust: {', '.join(TRUST_POLICIES)}.",
     ),
     paused: bool = typer.Option(False, "--paused", help="Create without activating the timer."),
+    result_reporting: bool = typer.Option(
+        False,
+        "--result-reporting/--no-result-reporting",
+        help="Ask Pi for a structured task result for history and notifications.",
+    ),
     accept: bool = typer.Option(False, "--yes", "-y", help="Accept the schedule preview."),
 ) -> None:
     """Create and optionally activate a scheduled task."""
@@ -485,6 +492,7 @@ def add(
             timeout_seconds=parse_timeout(timeout),
             trust=trust,
             paused=paused,
+            result_reporting=result_reporting,
         )
         preview = validate_task(task)
         if task.trust == "inherit" and not has_saved_project_trust(task.working_directory):
@@ -554,6 +562,7 @@ def show(task_id: str = typer.Argument(..., help="Task ID to inspect.")) -> None
         ("Thinking", task.thinking),
         ("Timeout", f"{task.timeout_seconds} seconds"),
         ("Trust", task.trust),
+        ("Result reporting", "on" if task.result_reporting else "off"),
         ("State", state.detail),
     )
     for label, value in rows:
@@ -590,6 +599,11 @@ def edit(
     timeout: str | None = typer.Option(None, "--timeout", help="Run timeout, such as 30m or 2h."),
     trust: str | None = typer.Option(
         None, "--trust", help="Project trust: inherit, approve, or deny."
+    ),
+    result_reporting: bool | None = typer.Option(
+        None,
+        "--result-reporting/--no-result-reporting",
+        help="Enable or disable structured task results.",
     ),
 ) -> None:
     """Validate and apply configuration changes atomically."""
@@ -640,6 +654,8 @@ def edit(
             updated = replace(updated, timeout_seconds=parse_timeout(timeout))
         if trust is not None:
             updated = replace(updated, trust=trust)
+        if result_reporting is not None:
+            updated = replace(updated, result_reporting=result_reporting)
         if updated == previous:
             raise TaskError("no changes requested")
         validate_task(updated)

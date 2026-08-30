@@ -60,6 +60,7 @@ class Task:
     timeout_seconds: int
     trust: str
     paused: bool
+    result_reporting: bool
 
     @property
     def schedule_summary(self) -> str:
@@ -335,6 +336,7 @@ def serialize_task(task: Task) -> str:
             f"timeout_seconds = {task.timeout_seconds}",
             f"trust = {_toml_string(task.trust)}",
             f"paused = {'true' if task.paused else 'false'}",
+            f"result_reporting = {'true' if task.result_reporting else 'false'}",
             "",
             "[prompt]",
             f"{task.prompt_kind} = {_toml_string(task.prompt)}",
@@ -634,6 +636,9 @@ def load_task(path: Path) -> Task:
             catch_up = False
         else:
             raise ValueError("unsupported task shape")
+        result_reporting = data.get("result_reporting", False)
+        if not isinstance(result_reporting, bool):
+            raise ValueError("result_reporting must be a boolean")
         return Task(
             task_id=data["id"],
             name=data.get("name"),
@@ -648,6 +653,7 @@ def load_task(path: Path) -> Task:
             timeout_seconds=data["timeout_seconds"],
             trust=data["trust"],
             paused=data["paused"],
+            result_reporting=result_reporting,
         )
     except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
         raise TaskError(f"could not read task definition {path}: {error}") from error

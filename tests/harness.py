@@ -93,10 +93,11 @@ def add_task(
     task_id: str = "daily-review",
     *,
     timeout: str = "20m",
+    result_reporting: bool = False,
     cli: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> None:
     runner = cli or run_cli
-    result = runner(
+    arguments = [
         "add",
         task_id,
         "--name",
@@ -116,8 +117,10 @@ def add_task(
         "--trust",
         "deny",
         "--yes",
-        env=env,
-    )
+    ]
+    if result_reporting:
+        arguments.append("--result-reporting")
+    result = runner(*arguments, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
