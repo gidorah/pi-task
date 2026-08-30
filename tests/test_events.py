@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from pi_task.events import StreamObservation, classify_run_status, consume_event_line
+from pi_task.events import (
+    StreamObservation,
+    classify_run_status,
+    consume_event_line,
+    parse_result_report,
+)
 
 
 def test_consume_session_and_successful_assistant_completion() -> None:
@@ -110,6 +115,67 @@ def test_recovered_tool_error_does_not_override_final_success() -> None:
         )
         == "succeeded"
     )
+
+
+def test_final_assistant_result_block_is_parsed() -> None:
+    observation = StreamObservation()
+    content = (
+        "Work is partly done.\n\n<pi-task-result>\n"
+        '{"outcome":"partial","summary":"Updated config; restart remains."}\n'
+        "</pi-task-result>"
+    )
+    consume_event_line(
+        observation,
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content}],
+                    "stopReason": "stop",
+                },
+            }
+        ),
+    )
+    consume_event_line(
+        observation,
+        json.dumps(
+            {
+                "type": "agent_end",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": content}],
+                        "stopReason": "stop",
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert observation.final_assistant_text == content
+    assert parse_result_report(observation.final_assistant_text) == (
+        "partial",
+        "Updated config; restart remains.",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "No report",
+        '<pi-task-result>{"outcome":"nope","summary":"bad"}</pi-task-result>',
+        '<pi-task-result>{"outcome":"succeeded"}</pi-task-result>',
+        "<pi-task-result>{not json}</pi-task-result>",
+        (
+            '<pi-task-result>{"outcome":"succeeded","summary":"one"}</pi-task-result>\n'
+            '<pi-task-result>{"outcome":"failed","summary":"two"}</pi-task-result>'
+        ),
+        '<pi-task-result>{"outcome":"succeeded","summary":"done"}</pi-task-result> trailing',
+    ],
+)
+def test_result_report_rejects_missing_or_malformed_final_block(text: str) -> None:
+    assert parse_result_report(text) is None
 
 
 def test_length_exhaustion_and_missing_response_fail() -> None:

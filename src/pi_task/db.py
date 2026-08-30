@@ -13,7 +13,7 @@ from typing import Literal, cast
 RunSource = Literal["scheduled", "manual"]
 RunStatus = Literal["running", "succeeded", "failed", "timed_out", "cancelled", "skipped"]
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # SQL migrations must be idempotent: executescript commits and connections use
 # isolation_level=None, so a crash between applying DDL and recording the version
@@ -68,6 +68,12 @@ def _migrate_v2(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(connection, "runs", "invocation_id", "TEXT")
 
 
+def _migrate_v3(connection: sqlite3.Connection) -> None:
+    """Add optional structured task result columns."""
+    _add_column_if_missing(connection, "runs", "result_outcome", "TEXT")
+    _add_column_if_missing(connection, "runs", "result_summary", "TEXT")
+
+
 @dataclass(frozen=True)
 class RunRecord:
     id: str
@@ -92,6 +98,8 @@ class RunRecord:
     error: str | None
     unit_name: str | None = None
     invocation_id: str | None = None
+    result_outcome: str | None = None
+    result_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,8 @@ class RunCompletion:
     cache_write_tokens: int | None
     cost_total: float | None
     error: str | None
+    result_outcome: str | None = None
+    result_summary: str | None = None
 
 
 def _state_home() -> Path:
@@ -163,6 +173,8 @@ def migrate(connection: sqlite3.Connection) -> None:
             connection.executescript(_MIGRATIONS_SQL[version])
         elif version == 2:
             _migrate_v2(connection)
+        elif version == 3:
+            _migrate_v3(connection)
         else:
             raise RuntimeError(f"missing migration for schema version {version}")
         connection.execute("INSERT INTO schema_migrations (version) VALUES (?)", (version,))
@@ -233,7 +245,9 @@ def finish_run(
             cache_read_tokens = ?,
             cache_write_tokens = ?,
             cost_total = ?,
-            error = ?
+            error = ?,
+            result_outcome = ?,
+            result_summary = ?
         WHERE id = ?
         """
     if only_if_running:
@@ -252,6 +266,8 @@ def finish_run(
             completion.cache_write_tokens,
             completion.cost_total,
             completion.error,
+            completion.result_outcome,
+            completion.result_summary,
             run_id,
         ),
     )
@@ -283,6 +299,8 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
         error=row["error"],
         unit_name=row["unit_name"],
         invocation_id=row["invocation_id"],
+        result_outcome=row["result_outcome"],
+        result_summary=row["result_summary"],
     )
 
 

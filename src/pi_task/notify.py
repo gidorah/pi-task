@@ -13,7 +13,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 from pi_task.db import RunRecord, RunSource, RunStatus
 
-TriggerChoice = Literal["success", "fail", "both", "none"]
+TriggerChoice = Literal["success", "attention", "both", "none"]
 
 
 class NotifyError(Exception):
@@ -26,7 +26,7 @@ class NotifyConfig:
     topic: str
     token: str | None
     on_success: bool
-    on_fail: bool
+    on_attention: bool
 
 
 @dataclass(frozen=True)
@@ -72,22 +72,22 @@ def parse_trigger_choice(value: str) -> tuple[bool, bool]:
     choice = value.strip().lower()
     if choice == "success":
         return True, False
-    if choice == "fail":
+    if choice in {"attention", "fail"}:
         return False, True
     if choice == "both":
         return True, True
     if choice in {"none", "off", "neither"}:
         return False, False
-    raise NotifyError("triggers must be one of: success, fail, both, none")
+    raise NotifyError("triggers must be one of: success, attention, both, none")
 
 
 def trigger_choice(config: NotifyConfig) -> TriggerChoice:
-    if config.on_success and config.on_fail:
+    if config.on_success and config.on_attention:
         return "both"
     if config.on_success:
         return "success"
-    if config.on_fail:
-        return "fail"
+    if config.on_attention:
+        return "attention"
     return "none"
 
 
@@ -97,7 +97,7 @@ def validate_config(config: NotifyConfig) -> NotifyConfig:
         topic=normalize_topic(config.topic),
         token=(config.token.strip() or None) if config.token is not None else None,
         on_success=config.on_success,
-        on_fail=config.on_fail,
+        on_attention=config.on_attention,
     )
 
 
@@ -113,7 +113,7 @@ def serialize_notify_config(config: NotifyConfig) -> str:
     lines.extend(
         [
             f"on_success = {'true' if validated.on_success else 'false'}",
-            f"on_fail = {'true' if validated.on_fail else 'false'}",
+            f"on_attention = {'true' if validated.on_attention else 'false'}",
             "",
         ]
     )
@@ -139,16 +139,16 @@ def load_notify_config() -> NotifyConfig | None:
         if token is not None and not isinstance(token, str):
             raise NotifyError("token must be a string")
         on_success = data.get("on_success", False)
-        on_fail = data.get("on_fail", False)
-        if not isinstance(on_success, bool) or not isinstance(on_fail, bool):
-            raise NotifyError("on_success and on_fail must be booleans")
+        on_attention = data.get("on_attention", data.get("on_fail", False))
+        if not isinstance(on_success, bool) or not isinstance(on_attention, bool):
+            raise NotifyError("on_success and on_attention must be booleans")
         return validate_config(
             NotifyConfig(
                 base_url=str(data["base_url"]),
                 topic=str(data["topic"]),
                 token=token,
                 on_success=on_success,
-                on_fail=on_fail,
+                on_attention=on_attention,
             )
         )
     except NotifyError:
@@ -165,17 +165,22 @@ def format_config_for_display(config: NotifyConfig) -> str:
         f"Token: {token_display}",
         f"Triggers: {trigger_choice(config)}",
         f"  on_success: {config.on_success}",
-        f"  on_fail: {config.on_fail}",
+        f"  on_attention: {config.on_attention}",
     ]
     return "\n".join(lines)
 
 
-def should_notify(config: NotifyConfig, status: RunStatus) -> bool:
+def should_notify(
+    config: NotifyConfig,
+    status: RunStatus,
+    *,
+    result_outcome: str | None = None,
+) -> bool:
     if status == "running":
         return False
-    if status == "succeeded":
+    if status == "succeeded" and result_outcome in {None, "succeeded"}:
         return config.on_success
-    return config.on_fail
+    return config.on_attention
 
 
 def build_notification(
@@ -186,10 +191,29 @@ def build_notification(
     source: RunSource,
     duration_ms: int | None,
     error: str | None,
+    result_outcome: str | None = None,
+    result_summary: str | None = None,
 ) -> NotificationPayload:
     label = (task_name or "").strip() or task_id
-    succeeded = status == "succeeded"
-    title = f"{label}: {'Succeeded' if succeeded else 'Failed'}"
+    if status != "succeeded":
+        status_titles = {
+            "failed": "Failed",
+            "timed_out": "Timed out",
+            "cancelled": "Cancelled",
+            "skipped": "Skipped",
+            "running": "Running",
+        }
+        result_title = status_titles[status]
+    else:
+        result_title = {
+            None: "Completed",
+            "succeeded": "Succeeded",
+            "partial": "Partially completed",
+            "blocked": "Blocked",
+            "failed": "Failed",
+            "unknown": "Result unknown",
+        }.get(result_outcome, "Result unknown")
+    title = f"{label}: {result_title}"
     duration = "unknown" if duration_ms is None else f"{duration_ms / 1000:.1f}s"
     lines = [
         f"Status: {status}",
@@ -198,6 +222,10 @@ def build_notification(
     ]
     if error:
         lines.append(f"Error: {error}")
+    if result_summary:
+        summary = " ".join(result_summary.split())[:500]
+        lines.append(f"Result: {summary}")
+    succeeded = status == "succeeded" and result_outcome in {None, "succeeded"}
     return NotificationPayload(
         title=title,
         body="\n".join(lines),
@@ -248,6 +276,8 @@ def notification_payload_for_run(record: RunRecord) -> NotificationPayload:
         source=record.source,
         duration_ms=record.duration_ms,
         error=record.error,
+        result_outcome=record.result_outcome,
+        result_summary=record.result_summary,
     )
 
 
@@ -257,7 +287,11 @@ def maybe_notify_run(record: RunRecord) -> None:
         return
     try:
         config = load_notify_config()
-        if config is None or not should_notify(config, record.status):
+        if config is None or not should_notify(
+            config,
+            record.status,
+            result_outcome=record.result_outcome,
+        ):
             return
         payload = notification_payload_for_run(record)
         publish_notification(config, payload)

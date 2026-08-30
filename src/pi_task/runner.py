@@ -32,6 +32,7 @@ from pi_task.events import (
     StreamObservation,
     classify_run_status,
     consume_event_line,
+    parse_result_report,
     unexpected_output_diagnostic,
 )
 from pi_task.locks import LockConflict, RunLocks, acquire_run_locks, normalize_working_directory
@@ -64,6 +65,7 @@ class TaskSnapshot:
     timeout_seconds: int
     trust: str
     paused: bool
+    result_reporting: bool
 
     @classmethod
     def from_task(cls, task: Task) -> TaskSnapshot:
@@ -81,7 +83,26 @@ class TaskSnapshot:
             timeout_seconds=task.timeout_seconds,
             trust=task.trust,
             paused=task.paused,
+            result_reporting=task.result_reporting,
         )
+
+
+RESULT_REPORTING_INSTRUCTION = """Report the task result at the very end of your final response
+as exactly:
+<pi-task-result>
+{"outcome":"succeeded","summary":"Short concrete result summary"}
+</pi-task-result>
+Use succeeded when all requested work is done. Use partial when meaningful requested
+work is done but requested work remains. Use blocked when no meaningful requested work
+is done and user or external action is required. Use failed when no meaningful
+requested work is done and no external unblock is available. Use unknown when you
+cannot assess it. Allowed outcomes: succeeded, partial, blocked, failed, unknown."""
+
+
+def effective_prompt(snapshot: TaskSnapshot, prompt_text: str) -> str:
+    if not snapshot.result_reporting:
+        return prompt_text
+    return f"{prompt_text}\n\n{RESULT_REPORTING_INSTRUCTION}"
 
 
 def resolve_pi() -> str:
@@ -553,7 +574,7 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
     command = build_pi_command(
         pi_executable=pi_executable,
         snapshot=snapshot,
-        prompt_text=prepared.prompt_text,
+        prompt_text=effective_prompt(snapshot, prepared.prompt_text),
         session_name=prepared.session_name,
     )
 
@@ -674,6 +695,7 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
                     exit_code=process.returncode,
                     error=error,
                 ),
+                expect_result=snapshot.result_reporting,
             )
 
         status = classify_run_status(
@@ -694,6 +716,7 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
                 exit_code=exit_code,
                 error=error,
             ),
+            expect_result=snapshot.result_reporting,
         )
     except BaseException as exc:
         # Ensure the run never remains stuck in "running" after wrapper death.
@@ -723,6 +746,7 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
                 status=status,
                 observation=observation,
                 error=aligned,
+                expect_result=snapshot.result_reporting and process is not None,
             )
         _finalize(
             run_id=run_id,
@@ -730,6 +754,7 @@ def _execute_locked_run(prepared: PreparedRun) -> int:
             status=status,
             observation=observation,
             error=aligned,
+            expect_result=snapshot.result_reporting and process is not None,
         )
         raise
     finally:
@@ -793,6 +818,7 @@ def _finalize(
     status: RunStatus,
     observation: StreamObservation,
     error: str | None,
+    expect_result: bool = False,
 ) -> int:
     finished = _now()
     duration_ms = max(0, int((finished - started).total_seconds() * 1000))
@@ -811,6 +837,16 @@ def _finalize(
     output_tokens = usage.output_tokens if observation.saw_assistant else None
     cache_read = usage.cache_read_tokens if observation.saw_assistant else None
     cache_write = usage.cache_write_tokens if observation.saw_assistant else None
+    result_outcome: str | None = None
+    result_summary: str | None = None
+    if expect_result:
+        result = parse_result_report(observation.final_assistant_text)
+        if result is None:
+            result_outcome = "unknown"
+            result_summary = "Agent did not provide a usable result."
+            _log(f"run {run_id}: agent did not provide a usable result")
+        else:
+            result_outcome, result_summary = result
     with open_db() as connection:
         finish_run(
             connection,
@@ -827,6 +863,8 @@ def _finalize(
                 cache_write_tokens=cache_write,
                 cost_total=usage.cost_total,
                 error=error,
+                result_outcome=result_outcome,
+                result_summary=result_summary,
             ),
         )
 

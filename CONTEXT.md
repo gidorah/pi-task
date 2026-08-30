@@ -20,10 +20,14 @@ _Avoid_: Execution, job
 The persistent Pi conversation created for exactly one run and available for interactive continuation after that run finishes.
 _Avoid_: Run history, transcript
 
+**Result**:
+An optional agent-reported assessment of whether the Task's requested work succeeded, partially completed, was blocked, failed, or could not be assessed. A Result does not replace the Run's operational status.
+_Avoid_: Run status, verified outcome
+
 **Pause**:
 A task state that suppresses future scheduled runs without cancelling an active run and without replaying occurrences missed while paused.
 _Avoid_: Disable, stop
 
 **Notification**:
-A push alert about one terminal Run, sent only when that Run's outcome matches the operator's configured triggers.
+A push alert about one terminal Run, sent only when that Run's status and optional Result match the operator's configured triggers.
 _Avoid_: Alert, webhook, message

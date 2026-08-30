@@ -35,9 +35,10 @@ if name == "pi":
         "timestamp": timestamp,
         "cwd": str(cwd),
     }
+    assistant_text = os.environ.get("FAKE_ASSISTANT_TEXT", "done")
     assistant = {
         "role": "assistant",
-        "content": [{"type": "text", "text": "done"}],
+        "content": [{"type": "text", "text": assistant_text}],
         "provider": "acme",
         "model": "rocket",
         "usage": {

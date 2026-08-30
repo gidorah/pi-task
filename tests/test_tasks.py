@@ -240,6 +240,38 @@ def test_add_list_and_show_an_enabled_calendar_task(
     assert "enabled (active)" in shown.stdout
 
 
+def test_result_reporting_is_opt_in_and_editable(
+    task_env: dict[str, str],
+    run_cli: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    default = _add_task(run_cli, task_env, "plain-task", "--calendar", "daily")
+    assert default.returncode == 0, default.stdout + default.stderr
+    plain_file = Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/plain-task.toml"
+    assert "result_reporting = false" in plain_file.read_text()
+    plain_file.write_text(plain_file.read_text().replace("result_reporting = false\n", ""))
+    legacy_shown = run_cli("show", "plain-task", env=task_env)
+    assert legacy_shown.returncode == 0, legacy_shown.stdout + legacy_shown.stderr
+    assert "Result reporting: off" in legacy_shown.stdout
+
+    reported = _add_task(
+        run_cli,
+        task_env,
+        "reported-task",
+        "--calendar",
+        "daily",
+        "--result-reporting",
+    )
+    assert reported.returncode == 0, reported.stdout + reported.stderr
+    reported_file = Path(task_env["XDG_CONFIG_HOME"]) / "pi-task/tasks/reported-task.toml"
+    assert "result_reporting = true" in reported_file.read_text()
+    shown = run_cli("show", "reported-task", env=task_env)
+    assert "Result reporting: on" in shown.stdout
+
+    edited = run_cli("edit", "reported-task", "--no-result-reporting", env=task_env)
+    assert edited.returncode == 0, edited.stdout + edited.stderr
+    assert "result_reporting = false" in reported_file.read_text()
+
+
 def test_list_includes_timer_activity_in_current_state(
     task_env: dict[str, str],
     run_cli: Callable[..., subprocess.CompletedProcess[str]],
